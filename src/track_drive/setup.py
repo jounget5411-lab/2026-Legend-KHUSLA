@@ -27,6 +27,7 @@ setup(
             'track_drive = track_drive.track_drive:main',
             'calib_collect = track_drive.calib_collect:main',
             'lane_detect = track_drive.lane_detect_node:main',
+            'yolo_detect = track_drive.yolo_detect_node:main',
             'integration = track_drive.integration_node:main',
             'fused_viewer = track_drive.fused_viewer_node:main',
             'path_planner = track_drive.path_planner_node:main',
