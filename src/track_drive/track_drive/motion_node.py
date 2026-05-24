@@ -26,7 +26,7 @@ class MotionNode(Node):
     def __init__(self):
         super().__init__("motion_node")
 
-        self.declare_parameter("steer_gain", 250.0)
+        self.declare_parameter("steer_gain", 450.0)
         self.declare_parameter("speed_default", 5.0)
         self.declare_parameter("angle_max", 100.0)
 
