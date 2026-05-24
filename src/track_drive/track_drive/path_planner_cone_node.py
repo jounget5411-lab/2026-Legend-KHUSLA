@@ -2,9 +2,10 @@
 """
 라바콘 경로계획 노드 — 게이트(콘 쌍) 기반 중앙 경로 생성.
 
-핵심: 비슷한 전방거리에서 트랙폭만큼 떨어진 두 콘을 쌍(게이트)으로 묶고,
-게이트 중점 + 싱글 콘 오프셋을 합쳐 중앙선 피팅.
-Y 부호 기반 좌우 분리 없음 → 곡선에서도 안정.
+좌/우 판단을 y부호가 아니라 "트랙 중앙선" 기준으로 한다:
+- 게이트 있으면 → 게이트 중점이 중앙 기준
+- 게이트 없고 싱글만 → 이전 프레임 중앙선이 기준
+→ 곡선에서 우측 콘이 y>0에 와도 정확히 판단.
 
 구독: /fused/obstacles, /auto_mode, /measure_width
 발행: /center_path, /target, /lane_left, /lane_right
@@ -23,57 +24,43 @@ from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
 PLAN_HZ = 10
 
-# 콘 ROI
 CONE_X_MIN = 0.3
 CONE_X_MAX = 7.0
 
-# 트랙 폭 (실측)
 TRACK_WIDTH = 4.4
 TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
 
-# 게이트 매칭
-GATE_X_TOL = 1.5           # 같은 게이트로 묶을 전방(x) 차이 최대 (m)
-GATE_WIDTH_MIN = 3.0       # 게이트 폭 최소 (m) — 너무 가까운 쌍 제외
-GATE_WIDTH_MAX = 6.0       # 게이트 폭 최대 (m) — 너무 먼 쌍 제외
+GATE_X_TOL = 1.5
+GATE_WIDTH_MIN = 3.0
+GATE_WIDTH_MAX = 6.0
 
-# 피팅
 FIT_MIN_PTS_QUAD = 4
 FIT_MIN_PTS_LIN = 2
 
-# 중앙선 샘플
 SAMPLE_X_START = 0.5
 SAMPLE_X_END = 6.0
 SAMPLE_N = 25
 
-# 목표점
 TARGET_FORWARD_M = 1.5
 
-# 이전 경로 유지
 MEMORY_MAX_TICKS = 15
 
-# 폭 측정 (C키)
 WIDTH_MEASURE_XS = [1.0, 2.0, 3.0, 4.0, 5.0]
 WIDTH_COLLECT_FRAMES = 15
 
 # ======================== 게이트 매칭 ========================
 
 def _find_gates_and_singles(xs, ys):
-    """콘들을 게이트(쌍)와 싱글로 분류.
-
-    Returns: gate_centers [(x, y_mid)], singles [(x, y)]
-    """
     n = len(xs)
     if n == 0:
         return [], []
 
-    # x로 정렬
     order = np.argsort(xs)
     sx, sy = xs[order], ys[order]
 
     used = [False] * n
-    gates = []  # (x_mid, y_mid, y_a, y_b)
+    gates = []
 
-    # 모든 쌍 후보를 x 차이순으로 시도
     for i in range(n):
         if used[i]:
             continue
@@ -84,7 +71,7 @@ def _find_gates_and_singles(xs, ys):
                 continue
             dx = abs(sx[j] - sx[i])
             if dx > GATE_X_TOL:
-                break  # x 정렬이라 이후는 더 멀어짐
+                break
             dy = abs(sy[j] - sy[i])
             if GATE_WIDTH_MIN <= dy <= GATE_WIDTH_MAX:
                 if best_j < 0 or abs(dy - TRACK_WIDTH) < abs(best_width - TRACK_WIDTH):
@@ -97,11 +84,18 @@ def _find_gates_and_singles(xs, ys):
             my = (sy[i] + sy[best_j]) / 2.0
             ya, yb = sy[i], sy[best_j]
             if ya < yb:
-                ya, yb = yb, ya  # ya = 좌측(y+), yb = 우측(y-)
+                ya, yb = yb, ya
             gates.append((mx, my, ya, yb))
 
     singles = [(sx[i], sy[i]) for i in range(n) if not used[i]]
     return gates, singles
+
+
+def _center_y_at(coef, x):
+    """이전 중앙선 계수로 특정 x에서의 중앙 y를 구함."""
+    if coef is None:
+        return 0.0
+    return float(np.polyval(coef, x))
 
 
 # ======================== 헬퍼 ========================
@@ -141,7 +135,8 @@ class PathPlannerConeNode(Node):
 
         self._auto = False
         self._obstacles = []
-        self._prev_center = None
+        self._prev_center = None        # (sample_xs, center_ys)
+        self._prev_center_coef = None   # 이전 중앙선 피팅 계수 (좌우 판단 기준)
         self._stale_ticks = 999
         self._width_collecting = 0
         self._width_samples = []
@@ -181,7 +176,6 @@ class PathPlannerConeNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
-        # ROI 필터
         all_x = np.array([o[0] for o in self._obstacles])
         all_y = np.array([o[1] for o in self._obstacles])
         if all_x.size > 0:
@@ -189,61 +183,56 @@ class PathPlannerConeNode(Node):
             all_x, all_y = all_x[roi], all_y[roi]
 
         if all_x.size == 0:
-            self._stale_ticks += 1
-            if self._prev_center is not None and self._stale_ticks < MEMORY_MAX_TICKS:
-                sx, cy = self._prev_center
-                self._pub_center.publish(_poses_from_xy(stamp, sx, cy))
-                idx = int(np.argmin(np.abs(sx - TARGET_FORWARD_M)))
-                self._publish_target(stamp, sx[idx], cy[idx])
+            self._do_memory(stamp)
             return
 
-        # 게이트 매칭
         gates, singles = _find_gates_and_singles(all_x, all_y)
         n_gates = len(gates)
+        n_singles = len(singles)
 
-        # 중앙선 점 수집: 게이트 중점 + 싱글 오프셋
         center_pts_x = []
         center_pts_y = []
-        left_pts_x = []
-        left_pts_y = []
-        right_pts_x = []
-        right_pts_y = []
 
+        # --- 게이트 중점 ---
         for gx, gy_mid, ya, yb in gates:
             center_pts_x.append(gx)
             center_pts_y.append(gy_mid)
-            left_pts_x.append(gx)
-            left_pts_y.append(ya)
-            right_pts_x.append(gx)
-            right_pts_y.append(yb)
 
-        # 싱글: 게이트가 있으면 중앙선 추세에서 어느 쪽인지 추정, 없으면 스킵
-        if n_gates >= 1 and singles:
-            gate_center_mean_y = np.mean(center_pts_y)
+        # --- 싱글 콘: 중앙 기준으로 좌우 판단 ---
+        if singles:
+            if n_gates >= 1:
+                # 게이트 중점 평균을 중앙 기준으로
+                ref_coef = None
+                ref_mean_y = np.mean(center_pts_y)
+            elif self._prev_center_coef is not None:
+                # 이전 프레임 중앙선을 기준으로
+                ref_coef = self._prev_center_coef
+                ref_mean_y = None
+            else:
+                # 기준 없음 — 싱글 스킵
+                ref_coef = None
+                ref_mean_y = None
+
             for sx_s, sy_s in singles:
-                if sy_s > gate_center_mean_y:
-                    # 좌측 콘 → 중앙 = sy - half_width
+                if ref_coef is not None:
+                    center_y_here = _center_y_at(ref_coef, sx_s)
+                elif ref_mean_y is not None:
+                    center_y_here = ref_mean_y
+                else:
+                    continue  # 기준 없으면 이 싱글 무시
+
+                if sy_s > center_y_here:
                     center_pts_x.append(sx_s)
                     center_pts_y.append(sy_s - TRACK_HALF_WIDTH)
-                    left_pts_x.append(sx_s)
-                    left_pts_y.append(sy_s)
                 else:
-                    # 우측 콘 → 중앙 = sy + half_width
                     center_pts_x.append(sx_s)
                     center_pts_y.append(sy_s + TRACK_HALF_WIDTH)
-                    right_pts_x.append(sx_s)
-                    right_pts_y.append(sy_s)
 
         cx_arr = np.array(center_pts_x)
         cy_arr = np.array(center_pts_y)
 
         if len(cx_arr) == 0:
-            self._stale_ticks += 1
-            if self._prev_center is not None and self._stale_ticks < MEMORY_MAX_TICKS:
-                sx, cy = self._prev_center
-                self._pub_center.publish(_poses_from_xy(stamp, sx, cy))
-                idx = int(np.argmin(np.abs(sx - TARGET_FORWARD_M)))
-                self._publish_target(stamp, sx[idx], cy[idx])
+            self._do_memory(stamp)
             return
 
         # 피팅
@@ -253,13 +242,14 @@ class PathPlannerConeNode(Node):
         if fit_result is not None:
             deg, coef = fit_result
             center_ys = np.polyval(coef, sample_xs)
+            self._prev_center_coef = coef
         elif len(cx_arr) >= 1:
             center_ys = np.full(SAMPLE_N, float(np.mean(cy_arr)))
             deg = 0
+            self._prev_center_coef = np.array([float(np.mean(cy_arr))])
         else:
             return
 
-        # 좌/우 곡선 복원
         l_ys = center_ys + TRACK_HALF_WIDTH
         r_ys = center_ys - TRACK_HALF_WIDTH
         self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
@@ -273,14 +263,21 @@ class PathPlannerConeNode(Node):
         idx = int(np.argmin(np.abs(sample_xs - TARGET_FORWARD_M)))
         self._publish_target(stamp, sample_xs[idx], center_ys[idx])
 
-        # 로그 (1초마다)
         self._log_counter += 1
         if self._log_counter >= PLAN_HZ:
             self._log_counter = 0
-            n_singles = len(singles)
+            mode = "gate" if n_gates > 0 else "single+prev"
             self.get_logger().info(
-                f"gates={n_gates} singles={n_singles} → "
+                f"{mode}: gates={n_gates} singles={n_singles} → "
                 f"center {len(cx_arr)} pts, fit deg={deg}")
+
+    def _do_memory(self, stamp):
+        self._stale_ticks += 1
+        if self._prev_center is not None and self._stale_ticks < MEMORY_MAX_TICKS:
+            sx, cy = self._prev_center
+            self._pub_center.publish(_poses_from_xy(stamp, sx, cy))
+            idx = int(np.argmin(np.abs(sx - TARGET_FORWARD_M)))
+            self._publish_target(stamp, sx[idx], cy[idx])
 
     def _publish_target(self, stamp, x, y):
         t = PointStamped()
