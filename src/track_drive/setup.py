@@ -34,6 +34,11 @@ setup(
             'path_planner_cone = track_drive.path_planner_cone_node:main',
             'motion = track_drive.motion_node:main',
             'key_control = track_drive.key_control_node:main',
+            'jh_yolo = track_drive.jh_yolo_detect_node:main',
+            'jh_integration = track_drive.jh_integration_node:main',
+            'jh_planner = track_drive.jh_path_planner_node:main',
+            'jh_motion = track_drive.jh_motion_node:main',
+            'jh_viewer = track_drive.jh_fused_viewer_node:main',
         ],
     },
 )
