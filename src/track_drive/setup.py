@@ -28,6 +28,7 @@ setup(
             'calib_collect = track_drive.calib_collect:main',
             'lane_detect = track_drive.lane_detect_node:main',
             'integration = track_drive.integration_node:main',
+            'fused_viewer = track_drive.fused_viewer_node:main',
         ],
     },
 )
