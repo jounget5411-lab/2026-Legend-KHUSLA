@@ -92,10 +92,8 @@ class KeyControlNode(Node):
         self._pub_motor = self.create_publisher(XycarMotor, "/xycar_motor", 10)
         self._pub_measure = self.create_publisher(Empty, "/measure_width", 10)
 
-        self.create_subscription(
-            Odometry, "/odom", self._on_odom, qos_profile_sensor_data)
-        self.create_subscription(
-            Imu, "/imu", self._on_imu, qos_profile_sensor_data)
+        self.create_subscription(Odometry, "/odom", self._on_odom, 10)
+        self.create_subscription(Imu, "/imu", self._on_imu, 10)
 
         self.create_timer(1.0 / MOTOR_HZ, self._publish_motor)
         self.create_timer(1.0 / RECORD_HZ, self._record_tick)
