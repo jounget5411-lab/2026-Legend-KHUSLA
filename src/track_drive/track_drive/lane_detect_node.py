@@ -32,7 +32,7 @@ H_PIX2LIDAR = np.array([
 BEV_RES = 0.05          # m/pixel
 BEV_X_MIN = -2.0        # 후방 한계 (m)
 BEV_X_MAX = 12.0        # 전방 한계 (m)
-BEV_Y_HALF = 5.0        # 좌우 한계 (m)
+BEV_Y_HALF = 7.0        # 좌우 한계 (m)
 BEV_W = int(round((2 * BEV_Y_HALF) / BEV_RES))   # 200
 BEV_H = int(round((BEV_X_MAX - BEV_X_MIN) / BEV_RES))  # 280
 
