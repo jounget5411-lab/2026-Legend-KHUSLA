@@ -31,8 +31,8 @@ STEERING_CURVE_GAIN = 1.20
 STEER_FOCUS_X = 3.0      # 가중 peak 위치 (m)
 STEER_FOCUS_SIGMA = 2.0  # 가중 폭 (m, σ) — 곡선 진입을 미리 보도록 약간 넓게
 
-ANGLE_MIN = -45.0
-ANGLE_MAX = 45.0
+ANGLE_MIN = -80.0
+ANGLE_MAX = 80.0
 # 응답 빠르게 하려고 α↑ (한 프레임에 변화의 75% 반영).
 ANGLE_SMOOTH_ALPHA = 0.75
 ANGLE_MAX_STEP = 16.0
