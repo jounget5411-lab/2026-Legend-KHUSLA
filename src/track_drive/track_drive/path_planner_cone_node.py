@@ -12,7 +12,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Empty
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
 # ======================== 파라미터 (튜닝 가능) ========================
@@ -40,6 +40,10 @@ TARGET_FORWARD_M = 1.5     # 중앙선에서 목표점 전방 거리 (m)
 
 # 이전 경로 유지 (콘 없을 때)
 MEMORY_MAX_TICKS = 15      # 이전 경로를 유지할 최대 틱 (1.5초)
+
+# 트랙 폭 측정 (C키 트리거)
+WIDTH_MEASURE_XS = [1.0, 2.0, 3.0, 4.0, 5.0]  # 폭 측정할 전방 거리들 (m)
+WIDTH_COLLECT_FRAMES = 15  # C키 후 수집할 프레임 수 (1.5초)
 
 # ======================== 헬퍼 ========================
 
@@ -81,9 +85,12 @@ class PathPlannerConeNode(Node):
         self._obstacles = []
         self._prev_center = None   # (sample_xs, center_ys) 캐시
         self._stale_ticks = 999
+        self._width_collecting = 0
+        self._width_samples = []
 
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
         self.create_subscription(Bool, "/auto_mode", self._on_auto, 10)
+        self.create_subscription(Empty, "/measure_width", self._on_measure, 10)
 
         self._pub_center = self.create_publisher(PoseArray, "/center_path", 10)
         self._pub_target = self.create_publisher(PointStamped, "/target", 10)
@@ -102,7 +109,13 @@ class PathPlannerConeNode(Node):
             self._auto = msg.data
             self.get_logger().info(f"auto_mode = {'ON' if self._auto else 'OFF'}")
 
+    def _on_measure(self, msg):
+        self._width_collecting = WIDTH_COLLECT_FRAMES
+        self._width_samples = []
+        self.get_logger().info("width measurement started — collecting frames...")
+
     def _tick(self):
+        self._tick_width_measure()
         if not self._auto:
             return
 
@@ -167,6 +180,46 @@ class PathPlannerConeNode(Node):
         t_msg.point.x = float(sample_xs[idx])
         t_msg.point.y = float(center_ys[idx])
         self._pub_target.publish(t_msg)
+
+
+    def _tick_width_measure(self):
+        if self._width_collecting <= 0:
+            return
+        obs = self._obstacles
+        all_x = np.array([o[0] for o in obs])
+        all_y = np.array([o[1] for o in obs])
+        if all_x.size == 0:
+            self._width_collecting -= 1
+            return
+        roi = (all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
+        all_x, all_y = all_x[roi], all_y[roi]
+        lx, ly = all_x[all_y > 0.1], all_y[all_y > 0.1]
+        rx, ry = all_x[all_y < -0.1], all_y[all_y < -0.1]
+        if len(lx) >= FIT_MIN_PTS_LIN and len(rx) >= FIT_MIN_PTS_LIN:
+            try:
+                lc = np.polyfit(lx, ly, 1)
+                rc = np.polyfit(rx, ry, 1)
+                widths = [np.polyval(lc, x) - np.polyval(rc, x)
+                          for x in WIDTH_MEASURE_XS]
+                self._width_samples.append(
+                    (float(np.mean(widths)), len(lx), len(rx)))
+            except (np.linalg.LinAlgError, ValueError):
+                pass
+        self._width_collecting -= 1
+        if self._width_collecting == 0:
+            if self._width_samples:
+                ws = [s[0] for s in self._width_samples]
+                avg_w = float(np.mean(ws))
+                half = avg_w / 2.0
+                nl = self._width_samples[-1][1]
+                nr = self._width_samples[-1][2]
+                self.get_logger().info(
+                    f"track width: {avg_w:.2f} m (half: {half:.2f} m), "
+                    f"L {nl} pts / R {nr} pts, {len(ws)} frames averaged")
+            else:
+                self.get_logger().warn(
+                    "width measurement FAILED — not enough cones on both sides. "
+                    "Align car in straight section with cones visible on both sides.")
 
 
 def main(args=None):

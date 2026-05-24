@@ -19,7 +19,7 @@ import threading
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Empty
 from xycar_msgs.msg import XycarMotor
 
 # ======================== 수동 조작 파라미터 ========================
@@ -41,6 +41,7 @@ HELP_TEXT = """
   D / →   : 우회전
   Space   : 정지
   E       : speed=0 (조향 유지)
+  C       : 트랙 폭 측정 (정지 상태에서)
   Ctrl+C  : 종료
 ========================================
 """
@@ -73,6 +74,7 @@ class KeyControlNode(Node):
 
         self._pub_auto = self.create_publisher(Bool, "/auto_mode", 10)
         self._pub_motor = self.create_publisher(XycarMotor, "/xycar_motor", 10)
+        self._pub_measure = self.create_publisher(Empty, "/measure_width", 10)
 
         self.create_timer(1.0 / MOTOR_HZ, self._publish_motor)
 
@@ -104,6 +106,11 @@ class KeyControlNode(Node):
             if not self._auto_mode:
                 self._speed = 0.0
                 self._angle = 0.0
+            return
+
+        if key in ('c', 'C'):
+            self._pub_measure.publish(Empty())
+            print("\r  >>> MEASURING TRACK WIDTH...          ")
             return
 
         if self._auto_mode:
