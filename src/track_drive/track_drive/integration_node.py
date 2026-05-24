@@ -24,12 +24,12 @@ from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Pose, PoseArray
 
 # ======================== Ground H: 원본 픽셀(640×480) → lidar_frame 미터 ========================
-# config/homography_ground.npz 의 H. x=전방, y=좌.
+# config/homography_ground.npz 의 H. lidar_frame 좌표: row0=전방(X+), row1=좌(Y+).
 # p = H @ [u, v, 1];  x_fwd = p[0]/p[2],  y_left = p[1]/p[2]
 
 GROUND_H = np.array([
-    [-4.18097842466549e-03, -1.87301533010043e-04,  1.37819064484720e+00],
     [ 0.00000000000000e+00,  4.63055528548851e-03, -2.73689017508590e+00],
+    [ 4.18097842466549e-03,  1.87301533010043e-04, -1.37819064484720e+00],
     [ 0.00000000000000e+00, -2.40130177039888e-03,  5.16378846754945e-01],
 ], dtype=np.float64)
 
