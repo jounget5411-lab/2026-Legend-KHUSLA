@@ -2,7 +2,9 @@
 """
 라바콘 경로계획 노드 — 두 줄 콘 사이 중앙 경로 생성.
 
-구독: /fused/obstacles (PoseArray), /auto_mode (Bool)
+핵심: 좌/우 콘을 트랙폭만큼 평행이동해 합친 뒤 피팅 → 점 수 2배, 곡선 피팅 가능.
+
+구독: /fused/obstacles (PoseArray), /auto_mode (Bool), /measure_width (Empty)
 발행: /center_path, /target, /lane_left, /lane_right
 
 좌표계: lidar_frame (X=전방+, Y=좌+, 미터)
@@ -23,12 +25,13 @@ PLAN_HZ = 10              # 계획 주기 (Hz)
 CONE_X_MIN = 0.3           # 전방 최소 (m)
 CONE_X_MAX = 7.0           # 전방 최대 (m)
 
-# 피팅
-FIT_MIN_PTS_QUAD = 4       # 2차 피팅 최소 점수
-FIT_MIN_PTS_LIN = 2        # 1차 피팅 최소 점수
+# 피팅 최소 점수 (합친 후 기준)
+FIT_MIN_PTS_QUAD = 4       # 2차 피팅
+FIT_MIN_PTS_LIN = 2        # 1차 피팅
 
-# 트랙 폭 (한쪽만 있을 때 반대쪽 추정)
-TRACK_HALF_WIDTH = 1.2     # 중앙 → 콘 줄까지 거리 (m)
+# 트랙 폭
+TRACK_WIDTH = 4.4          # 좌 콘 줄 ~ 우 콘 줄 전체 폭 (m, 실측)
+TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0  # 2.2m
 
 # 중앙선 샘플
 SAMPLE_X_START = 0.5       # 샘플 시작 전방 (m)
@@ -42,25 +45,37 @@ TARGET_FORWARD_M = 1.5     # 중앙선에서 목표점 전방 거리 (m)
 MEMORY_MAX_TICKS = 15      # 이전 경로를 유지할 최대 틱 (1.5초)
 
 # 트랙 폭 측정 (C키 트리거)
-WIDTH_MEASURE_XS = [1.0, 2.0, 3.0, 4.0, 5.0]  # 폭 측정할 전방 거리들 (m)
-WIDTH_COLLECT_FRAMES = 15  # C키 후 수집할 프레임 수 (1.5초)
+WIDTH_MEASURE_XS = [1.0, 2.0, 3.0, 4.0, 5.0]
+WIDTH_COLLECT_FRAMES = 15
 
 # ======================== 헬퍼 ========================
 
 def _fit_curve(xs, ys):
-    """점들을 2차(충분하면) 또는 1차로 피팅. 실패 시 None."""
+    """점들을 2차(충분하면) 또는 1차로 피팅. (차수, coef) 또는 None."""
     n = len(xs)
     if n >= FIT_MIN_PTS_QUAD:
         try:
-            return np.polyfit(xs, ys, 2)
+            return 2, np.polyfit(xs, ys, 2)
         except (np.linalg.LinAlgError, ValueError):
             pass
     if n >= FIT_MIN_PTS_LIN:
         try:
-            return np.polyfit(xs, ys, 1)
+            return 1, np.polyfit(xs, ys, 1)
         except (np.linalg.LinAlgError, ValueError):
             pass
     return None
+
+
+def _merge_cones(lx, ly, rx, ry):
+    """좌/우 콘을 중앙선 기준으로 합침.
+
+    좌 콘: y를 -TRACK_HALF_WIDTH 해서 중앙 기준으로 이동
+    우 콘: y를 +TRACK_HALF_WIDTH 해서 중앙 기준으로 이동
+    합친 점들은 "중앙선"의 x, y를 나타냄.
+    """
+    merged_x = np.concatenate([lx, rx])
+    merged_y = np.concatenate([ly - TRACK_HALF_WIDTH, ry + TRACK_HALF_WIDTH])
+    return merged_x, merged_y
 
 
 def _poses_from_xy(stamp, xs, ys):
@@ -83,10 +98,11 @@ class PathPlannerConeNode(Node):
 
         self._auto = False
         self._obstacles = []
-        self._prev_center = None   # (sample_xs, center_ys) 캐시
+        self._prev_center = None
         self._stale_ticks = 999
         self._width_collecting = 0
         self._width_samples = []
+        self._log_counter = 0
 
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
         self.create_subscription(Bool, "/auto_mode", self._on_auto, 10)
@@ -98,7 +114,8 @@ class PathPlannerConeNode(Node):
         self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
-        self.get_logger().info("path_planner_cone_node started (auto=OFF)")
+        self.get_logger().info(
+            f"path_planner_cone_node started (track_width={TRACK_WIDTH:.1f}m, auto=OFF)")
 
     def _on_obs(self, msg: PoseArray):
         self._obstacles = [(p.position.x, p.position.y, p.position.z)
@@ -122,65 +139,78 @@ class PathPlannerConeNode(Node):
         stamp = self.get_clock().now().to_msg()
         obs = self._obstacles
 
-        # 콘 ROI 필터 + 좌/우 분리
+        # ROI 필터
         all_x = np.array([o[0] for o in obs])
         all_y = np.array([o[1] for o in obs])
         if all_x.size > 0:
             roi = (all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
             all_x, all_y = all_x[roi], all_y[roi]
 
+        # 좌/우 분리
         left_mask = all_y > 0.1
         right_mask = all_y < -0.1
         lx, ly = all_x[left_mask], all_y[left_mask]
         rx, ry = all_x[right_mask], all_y[right_mask]
 
-        l_coef = _fit_curve(lx, ly)
-        r_coef = _fit_curve(rx, ry)
+        n_left, n_right = len(lx), len(rx)
+        have_any = n_left >= 1 or n_right >= 1
 
-        have_left = l_coef is not None
-        have_right = r_coef is not None
-
-        sample_xs = np.linspace(SAMPLE_X_START, SAMPLE_X_END, SAMPLE_N)
-
-        if have_left and have_right:
-            l_ys = np.polyval(l_coef, sample_xs)
-            r_ys = np.polyval(r_coef, sample_xs)
-            center_ys = (l_ys + r_ys) / 2.0
-            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
-            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
-        elif have_left:
-            l_ys = np.polyval(l_coef, sample_xs)
-            center_ys = l_ys - TRACK_HALF_WIDTH
-            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
-        elif have_right:
-            r_ys = np.polyval(r_coef, sample_xs)
-            center_ys = r_ys + TRACK_HALF_WIDTH
-            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
-        else:
-            # 콘 없음 — 이전 경로 유지
+        if not have_any:
             self._stale_ticks += 1
             if self._prev_center is not None and self._stale_ticks < MEMORY_MAX_TICKS:
                 sample_xs, center_ys = self._prev_center
-            else:
-                return  # 데이터 없으면 발행 안 함
-            # 이전 경로 그대로 발행 (아래로)
+                self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
+                idx = int(np.argmin(np.abs(sample_xs - TARGET_FORWARD_M)))
+                self._publish_target(stamp, sample_xs[idx], center_ys[idx])
+            return
 
-        if have_left or have_right:
-            self._prev_center = (sample_xs, center_ys)
-            self._stale_ticks = 0
+        # 좌/우 합쳐서 중앙선 피팅 (핵심)
+        merged_x, merged_y = _merge_cones(lx, ly, rx, ry)
+        fit_result = _fit_curve(merged_x, merged_y)
 
-        # /center_path 발행
+        sample_xs = np.linspace(SAMPLE_X_START, SAMPLE_X_END, SAMPLE_N)
+
+        if fit_result is not None:
+            deg, coef = fit_result
+            center_ys = np.polyval(coef, sample_xs)
+
+            # 좌/우 곡선 복원 (중앙 + half_width)
+            l_ys = center_ys + TRACK_HALF_WIDTH
+            r_ys = center_ys - TRACK_HALF_WIDTH
+            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
+            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
+        elif n_left >= 1 and n_right < 1:
+            center_ys = np.full(SAMPLE_N, float(np.mean(ly)) - TRACK_HALF_WIDTH)
+            deg = 0
+        elif n_right >= 1 and n_left < 1:
+            center_ys = np.full(SAMPLE_N, float(np.mean(ry)) + TRACK_HALF_WIDTH)
+            deg = 0
+        else:
+            return
+
+        self._prev_center = (sample_xs, center_ys)
+        self._stale_ticks = 0
+
         self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
 
-        # /target: 전방 TARGET_FORWARD_M 에 가장 가까운 점
         idx = int(np.argmin(np.abs(sample_xs - TARGET_FORWARD_M)))
-        t_msg = PointStamped()
-        t_msg.header.stamp = stamp
-        t_msg.header.frame_id = "lidar_frame"
-        t_msg.point.x = float(sample_xs[idx])
-        t_msg.point.y = float(center_ys[idx])
-        self._pub_target.publish(t_msg)
+        self._publish_target(stamp, sample_xs[idx], center_ys[idx])
 
+        # 주기 로그 (1초마다)
+        self._log_counter += 1
+        if self._log_counter >= PLAN_HZ:
+            self._log_counter = 0
+            self.get_logger().info(
+                f"cone L{n_left}/R{n_right} → merged {len(merged_x)} pts, "
+                f"fit deg={deg}")
+
+    def _publish_target(self, stamp, x, y):
+        t = PointStamped()
+        t.header.stamp = stamp
+        t.header.frame_id = "lidar_frame"
+        t.point.x = float(x)
+        t.point.y = float(y)
+        self._pub_target.publish(t)
 
     def _tick_width_measure(self):
         if self._width_collecting <= 0:
