@@ -32,8 +32,8 @@ OBS_X_MAX = 10.0        # 전방 최대 (m)
 OBS_Y_HALF = 4.5        # 좌우 ± (m)
 
 # 클러스터링
-CLUSTER_GAP = 0.25      # 인접 점 간 gap > 이 값이면 새 클러스터 (m)
-CLUSTER_MIN_PTS = 3     # 클러스터 최소 점 수
+CLUSTER_GAP = 0.35      # 인접 점 간 gap > 이 값이면 새 클러스터 (m)
+CLUSTER_MIN_PTS = 2     # 클러스터 최소 점 수 (먼 라바콘은 1~2점)
 CLUSTER_PADDING = 0.05  # 반경에 추가할 패딩 (m)
 
 # ======================== 장애물 클러스터링 (sumin.py 원본) ========================
