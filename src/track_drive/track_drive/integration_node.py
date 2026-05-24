@@ -26,14 +26,14 @@ from geometry_msgs.msg import Pose, PoseArray
 LIDAR_RANGE_MIN = 0.1   # 최소 유효 거리 (m) — 차체 반사 제거
 LIDAR_RANGE_MAX = 10.0  # 최대 유효 거리 (m)
 
-# 장애물 ROI (lidar_frame 미터)
+# 장애물 ROI (lidar_frame 미터) — 트랙 밖 노이즈 차단용, 튜닝 가능
 OBS_X_MIN = 0.1         # 전방 최소 (m)
-OBS_X_MAX = 10.0        # 전방 최대 (m)
-OBS_Y_HALF = 4.5        # 좌우 ± (m)
+OBS_X_MAX = 8.0         # 전방 최대 (m)
+OBS_Y_HALF = 3.0        # 좌우 ± (m)
 
-# 클러스터링
+# 클러스터링 — 튜닝 가능
 CLUSTER_GAP = 0.35      # 인접 점 간 gap > 이 값이면 새 클러스터 (m)
-CLUSTER_MIN_PTS = 2     # 클러스터 최소 점 수 (먼 라바콘은 1~2점)
+CLUSTER_MIN_PTS = 1     # 클러스터 최소 점 수 (먼 라바콘은 점 1개만 맞아도 잡음)
 CLUSTER_PADDING = 0.05  # 반경에 추가할 패딩 (m)
 
 # ======================== 장애물 클러스터링 (sumin.py 원본) ========================

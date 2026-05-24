@@ -120,10 +120,10 @@ class BEVViewer:
         self.ax.add_patch(plt.Polygon(
             veh, closed=True, color="#4ec3ff", alpha=0.9, zorder=10))
 
-        self.scan_pts = self.ax.scatter([], [], s=1, c="#666666", alpha=0.12, zorder=1)
-        self.fused_lane_pts = self.ax.scatter([], [], s=4, c="white", alpha=0.7,
+        self.scan_pts = self.ax.scatter([], [], s=1, c="#555555", alpha=0.10, zorder=1)
+        self.fused_lane_pts = self.ax.scatter([], [], s=3, c="white", alpha=0.6,
                                                zorder=3, label="/fused/lane")
-        self.obs_pts = self.ax.scatter([], [], s=40, c="red", alpha=0.8,
+        self.obs_pts = self.ax.scatter([], [], s=80, c="red", alpha=0.9,
                                         zorder=5, label="/fused/obstacles")
 
         self._status = self.ax.text(
