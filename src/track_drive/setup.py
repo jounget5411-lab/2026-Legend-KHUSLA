@@ -31,6 +31,7 @@ setup(
             'fused_viewer = track_drive.fused_viewer_node:main',
             'path_planner = track_drive.path_planner_node:main',
             'motion = track_drive.motion_node:main',
+            'key_control = track_drive.key_control_node:main',
         ],
     },
 )
