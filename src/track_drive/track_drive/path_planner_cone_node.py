@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-라바콘 경로계획 노드 — 게이트(콘 쌍) + 한쪽 콘 오프셋 + EMA 안정화.
+라바콘 경로계획 노드 — 라인 추적(tracking) 기반 좌우 분류.
 
-- 게이트 있으면 → 중점 중앙선
-- 게이트 없고 싱글만 → 콘 줄 피팅 + 2.2m 오프셋 (방향은 직전 상태 유지)
-- 매 프레임 중앙선을 이전과 EMA 평균 → 촐랑댐 제거
+콘 좌우를 y부호가 아니라 "이전 좌/우 라인과의 거리"로 배정.
+한 번 오른쪽으로 잡힌 라인은 곡선에서도 오른쪽 유지.
 
 구독: /fused/obstacles, /auto_mode, /measure_width
 발행: /center_path, /target, /lane_left, /lane_right
@@ -41,14 +40,8 @@ SAMPLE_X_END = 6.0
 SAMPLE_N = 25
 
 TARGET_FORWARD_M = 1.5
-
 MEMORY_MAX_TICKS = 15
-
-# EMA 안정화: 이전 경로 비중 (0.7 = 이전 70% + 새 30%)
 PATH_SMOOTH_ALPHA = 0.7
-
-# 한쪽 콘 방향: +1 = 콘이 좌측(중앙 = 콘 - half), -1 = 콘이 우측(중앙 = 콘 + half)
-# 게이트에서 자동 갱신, 싱글 구간에서는 고정 유지
 
 WIDTH_MEASURE_XS = [1.0, 2.0, 3.0, 4.0, 5.0]
 WIDTH_COLLECT_FRAMES = 15
@@ -59,13 +52,10 @@ def _find_gates_and_singles(xs, ys):
     n = len(xs)
     if n == 0:
         return [], []
-
     order = np.argsort(xs)
     sx, sy = xs[order], ys[order]
-
     used = [False] * n
     gates = []
-
     for i in range(n):
         if used[i]:
             continue
@@ -91,7 +81,6 @@ def _find_gates_and_singles(xs, ys):
             if ya < yb:
                 ya, yb = yb, ya
             gates.append((mx, my, ya, yb))
-
     singles = [(sx[i], sy[i]) for i in range(n) if not used[i]]
     return gates, singles
 
@@ -125,6 +114,34 @@ def _poses_from_xy(stamp, xs, ys):
     return msg
 
 
+# ======================== 콘→좌/우 배정 (라인 추적) ========================
+
+def _assign_cones_by_tracking(all_x, all_y, prev_left_coef, prev_right_coef):
+    """이전 좌/우 라인 coef 기준으로 각 콘을 가까운 쪽에 배정.
+
+    이전 라인 없으면 y부호로 초기 분류 (첫 프레임 전용).
+    """
+    lx, ly, rx, ry = [], [], [], []
+
+    have_prev = prev_left_coef is not None and prev_right_coef is not None
+
+    for x, y in zip(all_x, all_y):
+        if have_prev:
+            dl = abs(y - np.polyval(prev_left_coef, x))
+            dr = abs(y - np.polyval(prev_right_coef, x))
+            if dl < dr:
+                lx.append(x); ly.append(y)
+            else:
+                rx.append(x); ry.append(y)
+        else:
+            if y > 0:
+                lx.append(x); ly.append(y)
+            else:
+                rx.append(x); ry.append(y)
+
+    return (np.array(lx), np.array(ly), np.array(rx), np.array(ry))
+
+
 # ======================== ROS 노드 ========================
 
 class PathPlannerConeNode(Node):
@@ -133,9 +150,10 @@ class PathPlannerConeNode(Node):
 
         self._auto = False
         self._obstacles = []
-        self._prev_center_ys = None     # EMA 평균용
+        self._prev_center_ys = None
+        self._prev_left_coef = None
+        self._prev_right_coef = None
         self._stale_ticks = 999
-        self._single_side = +1          # +1=콘이 좌측, -1=콘이 우측. 게이트에서 갱신.
         self._width_collecting = 0
         self._width_samples = []
         self._log_counter = 0
@@ -153,7 +171,8 @@ class PathPlannerConeNode(Node):
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self.get_logger().info(
-            f"path_planner_cone (width={TRACK_WIDTH:.1f}m, smooth={PATH_SMOOTH_ALPHA}, auto=OFF)")
+            f"path_planner_cone (tracking, width={TRACK_WIDTH:.1f}m, "
+            f"smooth={PATH_SMOOTH_ALPHA}, auto=OFF)")
 
     def _on_obs(self, msg: PoseArray):
         self._obstacles = [(p.position.x, p.position.y, p.position.z)
@@ -175,6 +194,7 @@ class PathPlannerConeNode(Node):
             return
 
         stamp = self.get_clock().now().to_msg()
+        sample_xs = self._sample_xs
 
         all_x = np.array([o[0] for o in self._obstacles])
         all_y = np.array([o[1] for o in self._obstacles])
@@ -186,58 +206,56 @@ class PathPlannerConeNode(Node):
             self._do_memory(stamp)
             return
 
-        gates, singles = _find_gates_and_singles(all_x, all_y)
-        n_gates = len(gates)
-        n_singles = len(singles)
-        sample_xs = self._sample_xs
+        # ---- 콘 좌/우 배정 (라인 추적) ----
+        lx, ly, rx, ry = _assign_cones_by_tracking(
+            all_x, all_y, self._prev_left_coef, self._prev_right_coef)
 
-        raw_center_ys = None
-        mode = ""
+        n_left, n_right = len(lx), len(rx)
 
-        if n_gates >= 1:
-            # ---- 게이트 중점 + 싱글 합침 ----
-            cx_list = [gx for gx, _, _, _ in gates]
-            cy_list = [gy for _, gy, _, _ in gates]
-            gate_center_mean = np.mean(cy_list)
+        # ---- 좌/우 각각 피팅 ----
+        l_fit = _fit_curve(lx, ly) if n_left >= FIT_MIN_PTS_LIN else None
+        r_fit = _fit_curve(rx, ry) if n_right >= FIT_MIN_PTS_LIN else None
 
-            # 게이트에서 싱글 방향 갱신
-            for _, _, ya, yb in gates:
-                self._single_side = +1 if ya > yb else -1
+        have_left = l_fit is not None
+        have_right = r_fit is not None
 
-            for sx_s, sy_s in singles:
-                if sy_s > gate_center_mean:
-                    cy_list.append(sy_s - TRACK_HALF_WIDTH)
-                else:
-                    cy_list.append(sy_s + TRACK_HALF_WIDTH)
-                cx_list.append(sx_s)
+        if have_left and have_right:
+            l_deg, l_coef = l_fit
+            r_deg, r_coef = r_fit
+            l_ys = np.polyval(l_coef, sample_xs)
+            r_ys = np.polyval(r_coef, sample_xs)
+            raw_center_ys = (l_ys + r_ys) / 2.0
+            self._prev_left_coef = l_coef
+            self._prev_right_coef = r_coef
+            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
+            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
+            mode = f"both L{n_left}/R{n_right} deg={l_deg},{r_deg}"
 
-            fit = _fit_curve(np.array(cx_list), np.array(cy_list))
-            if fit is not None:
-                deg, coef = fit
-                raw_center_ys = np.polyval(coef, sample_xs)
-                mode = f"gate({n_gates})+s({n_singles}) deg={deg}"
-            else:
-                raw_center_ys = np.full(SAMPLE_N, float(np.mean(cy_list)))
-                mode = f"gate({n_gates}) mean"
+        elif have_left:
+            _, l_coef = l_fit
+            l_ys = np.polyval(l_coef, sample_xs)
+            raw_center_ys = l_ys - TRACK_HALF_WIDTH
+            self._prev_left_coef = l_coef
+            if self._prev_right_coef is None:
+                self._prev_right_coef = np.array([c for c in l_coef])
+                self._prev_right_coef[-1] -= TRACK_WIDTH
+            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
+            r_ys = raw_center_ys - TRACK_HALF_WIDTH
+            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
+            mode = f"left-only L{n_left}"
 
-        elif n_singles >= FIT_MIN_PTS_LIN:
-            # ---- 싱글만: 콘 줄 피팅 + 방향 고정 오프셋 ----
-            s_x = np.array([s[0] for s in singles])
-            s_y = np.array([s[1] for s in singles])
-            fit = _fit_curve(s_x, s_y)
-            if fit is not None:
-                deg, coef = fit
-                cone_ys = np.polyval(coef, sample_xs)
-            else:
-                cone_ys = np.full(SAMPLE_N, float(np.mean(s_y)))
-                deg = 0
-
-            if self._single_side > 0:
-                raw_center_ys = cone_ys - TRACK_HALF_WIDTH
-            else:
-                raw_center_ys = cone_ys + TRACK_HALF_WIDTH
-            side_label = "L" if self._single_side > 0 else "R"
-            mode = f"single({n_singles},{side_label}) deg={deg}"
+        elif have_right:
+            _, r_coef = r_fit
+            r_ys = np.polyval(r_coef, sample_xs)
+            raw_center_ys = r_ys + TRACK_HALF_WIDTH
+            self._prev_right_coef = r_coef
+            if self._prev_left_coef is None:
+                self._prev_left_coef = np.array([c for c in r_coef])
+                self._prev_left_coef[-1] += TRACK_WIDTH
+            l_ys = raw_center_ys + TRACK_HALF_WIDTH
+            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
+            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
+            mode = f"right-only R{n_right}"
 
         else:
             self._do_memory(stamp)
@@ -253,20 +271,15 @@ class PathPlannerConeNode(Node):
         self._prev_center_ys = center_ys
         self._stale_ticks = 0
 
-        # ---- 발행 ----
-        l_ys = center_ys + TRACK_HALF_WIDTH
-        r_ys = center_ys - TRACK_HALF_WIDTH
-        self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
-        self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
         self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
-
         idx = int(np.argmin(np.abs(sample_xs - TARGET_FORWARD_M)))
         self._publish_target(stamp, sample_xs[idx], center_ys[idx])
 
         self._log_counter += 1
         if self._log_counter >= PLAN_HZ:
             self._log_counter = 0
-            self.get_logger().info(mode)
+            trk = "tracked" if self._prev_left_coef is not None else "init"
+            self.get_logger().info(f"{mode} [{trk}]")
 
     def _do_memory(self, stamp):
         self._stale_ticks += 1
