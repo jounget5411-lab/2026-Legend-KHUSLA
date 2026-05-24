@@ -18,7 +18,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import PoseArray
+from geometry_msgs.msg import PoseArray, PointStamped
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -34,7 +34,7 @@ from matplotlib.animation import FuncAnimation
 
 BEV_X_MIN, BEV_X_MAX = -2.0, 12.0   # 전방 범위 (m)
 BEV_Y_HALF = 5.0                      # 좌우 ±5m
-LIDAR_RANGE_MAX = 12.0
+LIDAR_RANGE_MAX = 15.0
 ANIM_INTERVAL_MS = 150
 
 # ======================== 공유 데이터 ========================
@@ -47,6 +47,14 @@ class SharedState:
         self.fused_lane_xs = np.array([])
         self.fused_lane_ys = np.array([])
         self.fused_obs = []  # (cx, cy, r)
+        self.center_xs = np.array([])
+        self.center_ys = np.array([])
+        self.left_xs = np.array([])
+        self.left_ys = np.array([])
+        self.right_xs = np.array([])
+        self.right_ys = np.array([])
+        self.target_x = None
+        self.target_y = None
 
 
 # ======================== ROS 노드 ========================
@@ -62,6 +70,14 @@ class ViewerSubscriber(Node):
             PoseArray, "/fused/lane", self._on_fused_lane, 10)
         self.create_subscription(
             PoseArray, "/fused/obstacles", self._on_fused_obs, 10)
+        self.create_subscription(
+            PoseArray, "/center_path", self._on_center, 10)
+        self.create_subscription(
+            PoseArray, "/lane_left", self._on_lane_left, 10)
+        self.create_subscription(
+            PoseArray, "/lane_right", self._on_lane_right, 10)
+        self.create_subscription(
+            PointStamped, "/target", self._on_target, 10)
 
         self.get_logger().info("fused_viewer_node started — subscribing only")
 
@@ -92,6 +108,32 @@ class ViewerSubscriber(Node):
         obs = [(p.position.x, p.position.y, p.position.z) for p in msg.poses]
         with self.state.lock:
             self.state.fused_obs = obs
+
+    def _on_center(self, msg):
+        xs = np.array([p.position.x for p in msg.poses], dtype=np.float32)
+        ys = np.array([p.position.y for p in msg.poses], dtype=np.float32)
+        with self.state.lock:
+            self.state.center_xs = xs
+            self.state.center_ys = ys
+
+    def _on_lane_left(self, msg):
+        xs = np.array([p.position.x for p in msg.poses], dtype=np.float32)
+        ys = np.array([p.position.y for p in msg.poses], dtype=np.float32)
+        with self.state.lock:
+            self.state.left_xs = xs
+            self.state.left_ys = ys
+
+    def _on_lane_right(self, msg):
+        xs = np.array([p.position.x for p in msg.poses], dtype=np.float32)
+        ys = np.array([p.position.y for p in msg.poses], dtype=np.float32)
+        with self.state.lock:
+            self.state.right_xs = xs
+            self.state.right_ys = ys
+
+    def _on_target(self, msg):
+        with self.state.lock:
+            self.state.target_x = msg.point.x
+            self.state.target_y = msg.point.y
 
 
 # ======================== matplotlib viewer ========================
@@ -125,6 +167,15 @@ class BEVViewer:
                                                zorder=3, label="/fused/lane")
         self.obs_pts = self.ax.scatter([], [], s=80, c="red", alpha=0.9,
                                         zorder=5, label="/fused/obstacles")
+        self.center_line, = self.ax.plot([], [], '-', color="magenta", lw=2.5,
+                                          alpha=0.9, zorder=7, label="/center_path")
+        self.left_line, = self.ax.plot([], [], '--', color="#00ff88", lw=1.2,
+                                        alpha=0.7, zorder=6)
+        self.right_line, = self.ax.plot([], [], '--', color="#00ff88", lw=1.2,
+                                         alpha=0.7, zorder=6)
+        self.target_marker, = self.ax.plot([], [], '*', color="yellow", ms=18,
+                                            mew=0.5, mec="black", zorder=8,
+                                            label="/target")
 
         self._status = self.ax.text(
             0.02, 0.98, "", transform=self.ax.transAxes,
@@ -150,6 +201,14 @@ class BEVViewer:
             fl_xs = self.state.fused_lane_xs.copy()
             fl_ys = self.state.fused_lane_ys.copy()
             obs = list(self.state.fused_obs)
+            c_xs = self.state.center_xs.copy()
+            c_ys = self.state.center_ys.copy()
+            l_xs = self.state.left_xs.copy()
+            l_ys = self.state.left_ys.copy()
+            r_xs = self.state.right_xs.copy()
+            r_ys = self.state.right_ys.copy()
+            t_x = self.state.target_x
+            t_y = self.state.target_y
 
         # 라이다 raw (옅은 회색)
         if scan_xs.size > 0:
@@ -171,10 +230,34 @@ class BEVViewer:
         else:
             self.obs_pts.set_offsets(np.empty((0, 2)))
 
+        # 중앙 경로 (마젠타 실선)
+        if c_xs.size > 0:
+            self.center_line.set_data(-c_ys, c_xs)
+        else:
+            self.center_line.set_data([], [])
+
+        # 좌/우 콘 곡선 (초록 점선)
+        if l_xs.size > 0:
+            self.left_line.set_data(-l_ys, l_xs)
+        else:
+            self.left_line.set_data([], [])
+        if r_xs.size > 0:
+            self.right_line.set_data(-r_ys, r_xs)
+        else:
+            self.right_line.set_data([], [])
+
+        # 목표점 (노란 별)
+        if t_x is not None:
+            self.target_marker.set_data([-t_y], [t_x])
+        else:
+            self.target_marker.set_data([], [])
+
         self._status.set_text(
             f"scan raw:  {scan_xs.size:5d} pts\n"
             f"fused lane:{fl_xs.size:5d} pts\n"
-            f"fused obs: {len(obs):5d}")
+            f"fused obs: {len(obs):5d}\n"
+            f"center:    {c_xs.size:5d} pts\n"
+            f"target:    {'({:.1f},{:.1f})'.format(t_x, t_y) if t_x is not None else 'none'}")
 
     def show(self):
         plt.show()
