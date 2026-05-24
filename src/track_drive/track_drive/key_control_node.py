@@ -21,6 +21,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, Empty
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from xycar_msgs.msg import XycarMotor
 
 # ======================== 파라미터 ========================
@@ -83,6 +84,9 @@ class KeyControlNode(Node):
         self._record_file = None
         self._odom_v = 0.0
         self._odom_omega = 0.0
+        self._imu_yaw_rate = 0.0
+        self._imu_ax = 0.0
+        self._imu_ay = 0.0
 
         self._pub_auto = self.create_publisher(Bool, "/auto_mode", 10)
         self._pub_motor = self.create_publisher(XycarMotor, "/xycar_motor", 10)
@@ -90,6 +94,8 @@ class KeyControlNode(Node):
 
         self.create_subscription(
             Odometry, "/odom", self._on_odom, qos_profile_sensor_data)
+        self.create_subscription(
+            Imu, "/imu", self._on_imu, qos_profile_sensor_data)
 
         self.create_timer(1.0 / MOTOR_HZ, self._publish_motor)
         self.create_timer(1.0 / RECORD_HZ, self._record_tick)
@@ -106,6 +112,11 @@ class KeyControlNode(Node):
         self._odom_v = msg.twist.twist.linear.x
         self._odom_omega = msg.twist.twist.angular.z
 
+    def _on_imu(self, msg: Imu):
+        self._imu_yaw_rate = msg.angular_velocity.z
+        self._imu_ax = msg.linear_acceleration.x
+        self._imu_ay = msg.linear_acceleration.y
+
     def _publish_motor(self):
         if self._auto_mode:
             return
@@ -121,10 +132,14 @@ class KeyControlNode(Node):
             return
         v = self._odom_v
         w = self._odom_omega
-        R = v / w if abs(w) > 0.001 else float('inf')
+        iw = self._imu_yaw_rate
+        R_odom = v / w if abs(w) > 0.001 else float('inf')
+        R_imu = v / iw if abs(iw) > 0.001 else float('inf')
         line = (f"{time.time():.3f}\t"
                 f"{self._angle:+7.1f}\t{self._speed:+6.1f}\t"
-                f"{v:+8.4f}\t{w:+8.4f}\t{R:+10.3f}\n")
+                f"{v:+8.4f}\t{w:+8.4f}\t{R_odom:+10.3f}\t"
+                f"{iw:+8.4f}\t{R_imu:+10.3f}\t"
+                f"{self._imu_ax:+8.4f}\t{self._imu_ay:+8.4f}\n")
         self._record_file.write(line)
         self._record_file.flush()
 
@@ -141,7 +156,7 @@ class KeyControlNode(Node):
             path = os.path.expanduser(f"~/xycar_ws/steer_log_{ts}.txt")
             self._record_file = open(path, 'w')
             self._record_file.write(
-                "# time\tcmd_angle\tcmd_speed\todom_v(m/s)\todom_omega(rad/s)\tR(m)\n")
+                "# time\tcmd_angle\tcmd_speed\todom_v\todom_w\tR_odom\timu_yaw_rate\tR_imu\timu_ax\timu_ay\n")
             self._recording = True
             print(f"\r  >>> RECORD ON — {path}          ")
 
