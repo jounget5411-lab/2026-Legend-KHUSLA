@@ -29,6 +29,8 @@ setup(
             'lane_detect = track_drive.lane_detect_node:main',
             'integration = track_drive.integration_node:main',
             'fused_viewer = track_drive.fused_viewer_node:main',
+            'path_planner = track_drive.path_planner_node:main',
+            'motion = track_drive.motion_node:main',
         ],
     },
 )
