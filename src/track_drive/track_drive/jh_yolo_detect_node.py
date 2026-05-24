@@ -47,11 +47,9 @@ EVENT_CLASS_IDS = {1, 3, 5, 7, 9, 11}  # CHILD_END, CHILD_START, GREEN, LEFT, RE
 # 마스크 픽셀 서브샘플 — 차선류가 아닌 도로 클래스(STOP/GOAL)에만 적용
 PIXEL_SUBSAMPLE = 3
 
-# 기본 모델 경로 — 이 소스 파일 기준 ../config/best.pt (src/track_drive/config/best.pt).
-# symlink-install이면 realpath가 워크스페이스 src로 풀려서 어디서 빌드해도 동작.
-_THIS_DIR = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_MODEL_PATH = os.path.realpath(
-    os.path.join(_THIS_DIR, "..", "config", "best.pt"))
+# 기본 모델 경로 — 워크스페이스 src 절대경로
+DEFAULT_MODEL_PATH = os.path.join(
+    os.path.expanduser("~"), "xycar_ws", "src", "track_drive", "config", "best.pt")
 
 # ======================== ROS 노드 ========================
 
