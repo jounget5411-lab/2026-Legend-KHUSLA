@@ -22,6 +22,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseArray, PointStamped
+from xycar_msgs.msg import XycarMotor
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -72,6 +73,8 @@ class SharedState:
         self.yellow_inlier_xs = np.array([])
         self.yellow_inlier_ys = np.array([])
         self.target_xy = None  # (x, y) or None
+        self.motor_angle = 0.0
+        self.motor_speed = 0.0
 
 
 # ======================== ROS 노드 ========================
@@ -101,6 +104,8 @@ class ViewerSubscriber(Node):
             PoseArray, "/fit/yellow_inliers", self._on_yellow_inliers, 10)
         self.create_subscription(
             PointStamped, "/target", self._on_target, 10)
+        self.create_subscription(
+            XycarMotor, "/xycar_motor", self._on_motor, 10)
 
         self.get_logger().info("fused_viewer_node started — subscribing only")
 
@@ -203,6 +208,11 @@ class ViewerSubscriber(Node):
     def _on_target(self, msg):
         with self.state.lock:
             self.state.target_xy = (msg.point.x, msg.point.y)
+
+    def _on_motor(self, msg):
+        with self.state.lock:
+            self.state.motor_angle = msg.angle
+            self.state.motor_speed = msg.speed
 
 
 # ======================== matplotlib viewer ========================
@@ -325,6 +335,8 @@ class BEVViewer:
             yi_ys = self.state.yellow_inlier_ys.copy()
             cls_hist = dict(self.state.fused_cls_hist)
             target = self.state.target_xy
+            m_angle = self.state.motor_angle
+            m_speed = self.state.motor_speed
 
         def _xy(xs, ys):
             return np.c_[-ys, xs] if xs.size > 0 else np.empty((0, 2))
@@ -387,7 +399,8 @@ class BEVViewer:
             f"stop/goal:  {fs_xs.size:3d}/{fg_xs.size:3d}\n"
             f"fused obs:  {len(obs):5d}\n"
             f"center:     {c_xs.size:5d} samp\n"
-            f"target:     {'on' if target else 'off':>5s}")
+            f"target:     {'on' if target else 'off':>5s}\n"
+            f"MOTOR ang={m_angle:+6.1f} spd={m_speed:+4.1f}")
 
     def show(self):
         plt.show()
