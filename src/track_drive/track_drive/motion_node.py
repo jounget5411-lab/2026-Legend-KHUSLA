@@ -5,7 +5,7 @@
 구독: /target (PointStamped, lidar_frame: x=전방, y=좌)
 발행: /xycar_motor (XycarMotor: angle, speed)
 
-control() 함수에 제어 로직을 채우면 됨.
+파라미터 실행 중 변경: ros2 param set /motion_node steer_gain 300.0
 """
 
 import math
@@ -15,25 +15,20 @@ from rclpy.node import Node
 from geometry_msgs.msg import PointStamped
 from xycar_msgs.msg import XycarMotor
 
-# ======================== 제어 파라미터 ========================
+# ======================== 기본값 ========================
 
-CONTROL_HZ = 10         # 제어 루프 주기 (Hz)
-
-# 여기에 제어 게인 — 나중에 PID로 교체
-STEER_P = 50.0          # 비례 조향 게인 (deg per rad)
-
-SPEED_DEFAULT = 5.0     # 기본 속도
-SPEED_STOP = 0.0
-ANGLE_MIN = -50.0
-ANGLE_MAX = 50.0
-
-TARGET_TIMEOUT_S = 0.5  # 이 시간 이상 목표 없으면 정지
+CONTROL_HZ = 10
+TARGET_TIMEOUT_S = 0.5
 
 # ======================== ROS 노드 ========================
 
 class MotionNode(Node):
     def __init__(self):
         super().__init__("motion_node")
+
+        self.declare_parameter("steer_gain", 250.0)
+        self.declare_parameter("speed_default", 5.0)
+        self.declare_parameter("angle_max", 100.0)
 
         self._target_x = None
         self._target_y = None
@@ -43,7 +38,11 @@ class MotionNode(Node):
         self._pub = self.create_publisher(XycarMotor, "/xycar_motor", 10)
         self.create_timer(1.0 / CONTROL_HZ, self._tick)
 
-        self.get_logger().info("motion_node started (P-control placeholder)")
+        g = self.get_parameter("steer_gain").value
+        s = self.get_parameter("speed_default").value
+        a = self.get_parameter("angle_max").value
+        self.get_logger().info(
+            f"motion_node started (gain={g}, speed={s}, angle_max={a})")
 
     def _on_target(self, msg: PointStamped):
         self._target_x = msg.point.x
@@ -54,15 +53,22 @@ class MotionNode(Node):
         now = self.get_clock().now()
 
         if self._target_stamp is None:
-            self._publish_motor(SPEED_STOP, 0.0)
+            self._publish_motor(0.0, 0.0)
             return
 
         age = (now - self._target_stamp).nanoseconds * 1e-9
         if age > TARGET_TIMEOUT_S:
-            self._publish_motor(SPEED_STOP, 0.0)
+            self._publish_motor(0.0, 0.0)
             return
 
-        angle, speed = control(self._target_x, self._target_y)
+        gain = self.get_parameter("steer_gain").value
+        speed = self.get_parameter("speed_default").value
+        a_max = self.get_parameter("angle_max").value
+
+        heading_rad = math.atan2(-self._target_y, max(self._target_x, 0.3))
+        angle = gain * heading_rad
+        angle = max(-a_max, min(a_max, angle))
+
         self._publish_motor(speed, angle)
 
     def _publish_motor(self, speed, angle):
@@ -70,36 +76,9 @@ class MotionNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "base_link"
         msg.speed = float(speed)
-        msg.angle = float(max(ANGLE_MIN, min(ANGLE_MAX, angle)))
+        msg.angle = float(angle)
         self._pub.publish(msg)
 
-
-# ======================== 제어 로직 ========================
-
-def control(target_x, target_y):
-    """목표점 → (angle, speed) 변환.
-
-    Parameters
-    ----------
-    target_x : float — 목표 전방 거리 (m)
-    target_y : float — 목표 좌우 거리 (m, 좌+)
-
-    Returns
-    -------
-    (angle, speed)  — 조향각 (deg, 좌+), 속도
-
-    ──────────────────────────────────────────────
-    여기에 제어 로직을 채운다 — 나중에 PID로 교체.
-    지금은 단순 P 제어: 목표 방향 각도에 비례해 조향.
-    ──────────────────────────────────────────────
-    """
-    heading_rad = math.atan2(-target_y, max(target_x, 0.3))
-    angle = STEER_P * heading_rad
-    speed = SPEED_DEFAULT
-    return angle, speed
-
-
-# ======================== main ========================
 
 def main(args=None):
     rclpy.init(args=args)
