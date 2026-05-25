@@ -70,6 +70,13 @@ LEFT_SIGN_CLS_ID = 7
 CHILD_START_CLS_ID = 3
 CHILD_END_CLS_ID = 1
 
+# ======================== 사람 감지 (PEDESTRIAN) ========================
+
+PED_X_MAX = 8.0             # 전방 이 거리 이내
+PED_ROAD_HALF_WIDTH = 2.0   # center_path 기준 ± 이 폭 안에 있으면 "도로 안"
+PED_MAX_CLUSTER_PTS = 10    # 클러스터 점 수 이 미만이면 사람 (차는 더 많음)
+PED_MIN_CLUSTER_PTS = 1     # 최소 점 수 (노이즈 제거)
+
 # ======================== 헬퍼 ========================
 
 def _poses_from_xy(stamp, xs, ys):
@@ -119,6 +126,9 @@ class PathPlannerNode(Node):
 
         # YOLO 이벤트
         self._events = []
+
+        # LANE 모드 중앙선 (사람 감지 기준선)
+        self._lane_center_coef = None
 
         # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
@@ -177,14 +187,10 @@ class PathPlannerNode(Node):
         elif self.phase == "CONE":
             self._tick_cone(stamp)
         elif self.phase == "LANE":
-            # self._check_lane_events()  # 예외 처리 활성화 시 주석 해제
+            self._check_pedestrian()
             self._tick_lane(stamp)
-        # elif self.phase == "EXCEPTION_1":
-        #     self._tick_exception_1(stamp)
-        # elif self.phase == "EXCEPTION_2":
-        #     self._tick_exception_2(stamp)
-        # elif self.phase == "EXCEPTION_3":
-        #     self._tick_exception_3(stamp)
+        elif self.phase == "PEDESTRIAN":
+            self._tick_pedestrian(stamp)
 
         # 로그
         self._log_counter += 1
@@ -279,41 +285,47 @@ class PathPlannerNode(Node):
                                  -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
         self._publish_target(stamp, TARGET_X, target_y)
 
-    # ================================================================
-    # 예외 상태 껍데기 — 주석 해제 + 로직 채워서 사용
-    # 전환: _check_lane_events()에서 self.phase = "EXCEPTION_1" 등
-    # 복귀: 각 _tick_exception_N()에서 self.phase = "LANE"
-    # ================================================================
-    #
-    # def _check_lane_events(self):
-    #     """LANE 주행 중 예외 상태 전환. 센서/YOLO/라이다 등 조건 자유."""
-    #     # 예외 1: 예) 빨간불 → 정지
-    #     # if RED_CLS_ID in self._events:
-    #     #     self.phase = "EXCEPTION_1"
-    #     #
-    #     # 예외 2: 예) 좌회전 표지
-    #     # if LEFT_SIGN_CLS_ID in self._events:
-    #     #     self.phase = "EXCEPTION_2"
-    #     #
-    #     # 예외 3: 예) 어린이구역
-    #     # if CHILD_START_CLS_ID in self._events:
-    #     #     self.phase = "EXCEPTION_3"
-    #     pass
-    #
-    # def _tick_exception_1(self, stamp):
-    #     """예외 1 처리. 끝나면 self.phase = "LANE"."""
-    #     # 예) 정지 후 초록불 대기
-    #     # if GREEN_CLS_ID in self._events:
-    #     #     self.phase = "LANE"
-    #     pass
-    #
-    # def _tick_exception_2(self, stamp):
-    #     """예외 2 처리. 끝나면 self.phase = "LANE"."""
-    #     self._tick_lane(stamp)  # 기본: 차선 주행 유지
-    #
-    # def _tick_exception_3(self, stamp):
-    #     """예외 3 처리. 끝나면 self.phase = "LANE"."""
-    #     self._tick_lane(stamp)  # 기본: 차선 주행 유지
+    # ---- PEDESTRIAN: 사람 감지 → 정지 → 도로 밖으로 나가면 출발 ----
+
+    def _check_pedestrian(self):
+        """LANE 주행 중 도로 안에 사람(작은 장애물) 있으면 정지."""
+        if self._lane_center_coef is None:
+            return
+
+        for ox, oy, _r in self._obstacles:
+            if ox > PED_X_MAX or ox < 0.3:
+                continue
+            center_y = float(np.polyval(self._lane_center_coef, ox))
+            if abs(oy - center_y) > PED_ROAD_HALF_WIDTH:
+                continue
+            # 도로 안, 8m 이내 — 클러스터 크기로 사람/차 구분
+            # _r은 클러스터 반경인데, 점 수는 직접 못 봄. 반경으로 대체:
+            # 사람은 작음(r < 0.3), 차는 큼(r > 0.5)
+            if _r < 0.4:
+                self.get_logger().info(
+                    f"PEDESTRIAN detected at ({ox:.1f},{oy:.1f}) r={_r:.2f} → STOP")
+                self.phase = "PEDESTRIAN"
+                return
+
+    def _tick_pedestrian(self, stamp):
+        """정지 상태. 사람이 도로 밖으로 나가면 LANE 복귀."""
+        # center_path 발행 안 함 → motion 정지
+        if self._lane_center_coef is None:
+            self.phase = "LANE"
+            return
+
+        ped_on_road = False
+        for ox, oy, _r in self._obstacles:
+            if ox > PED_X_MAX or ox < 0.3:
+                continue
+            center_y = float(np.polyval(self._lane_center_coef, ox))
+            if abs(oy - center_y) <= PED_ROAD_HALF_WIDTH and _r < 0.4:
+                ped_on_road = True
+                break
+
+        if not ped_on_road:
+            self.get_logger().info("Pedestrian cleared → LANE")
+            self.phase = "LANE"
 
     # ---- LANE (친구 plan() 그대로) ----
 
@@ -327,6 +339,11 @@ class PathPlannerNode(Node):
 
         if result is None:
             return
+
+        # center_path의 coef 저장 (사람 감지 기준선으로 사용)
+        all_fits = result.get("all_fits", [])
+        if all_fits:
+            self._lane_center_coef = all_fits[0]  # yellow_fit = center
 
         target_x, target_y = result["target"]
         sample_xs = result["sample_xs"]
