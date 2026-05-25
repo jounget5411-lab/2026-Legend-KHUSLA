@@ -44,8 +44,9 @@ CONE_SAMPLE_X_START = 0.5
 CONE_SAMPLE_X_END = 6.0
 CONE_SAMPLE_N = 25
 
-# CONE→LANE 전환: 콘 miss가 이 이상 연속 + lane 점이 일정 이상
-CONE_TO_LANE_MISS = 10
+# CONE→LANE 전환: 콘 miss가 이 이상 연속
+CONE_TO_LANE_MISS = 30          # 3초 연속 못 찾으면 전환
+CONE_GRACE_TICKS = 30           # CONE 진입 후 3초간 miss 카운트 안 함
 LANE_MIN_POINTS_FOR_SWITCH = 10
 
 # ======================== LANE 상수 (sm plan 간소화) ========================
@@ -99,6 +100,7 @@ class PathPlannerNode(Node):
         # CONE 상태
         self._cone_prev_fit = None
         self._cone_miss = 0
+        self._cone_grace = 0
 
         # LANE 상태
         self._lane_prev_fit = None
@@ -162,6 +164,8 @@ class PathPlannerNode(Node):
         if GREEN_CLS_ID in self._events:
             self.get_logger().info("GREEN detected → CONE")
             self.phase = "CONE"
+            self._cone_grace = CONE_GRACE_TICKS
+            self._cone_miss = 0
 
     # ---- CONE ----
 
@@ -200,17 +204,21 @@ class PathPlannerNode(Node):
                     except (np.linalg.LinAlgError, ValueError):
                         pass
 
+        # grace period 카운트다운
+        if self._cone_grace > 0:
+            self._cone_grace -= 1
+
         # EMA + miss
         if left_fit is None:
-            self._cone_miss += 1
+            if self._cone_grace <= 0:
+                self._cone_miss += 1
             if self._cone_prev_fit is not None and self._cone_miss <= CONE_FIT_MAX_MISS:
                 prev = self._cone_prev_fit.copy()
                 prev[0] *= max(0.0, 1.0 - self._cone_miss * 0.2)
                 left_fit = prev
             else:
                 self._cone_prev_fit = None
-                # 전환 체크
-                if self._cone_miss >= CONE_TO_LANE_MISS:
+                if self._cone_grace <= 0 and self._cone_miss >= CONE_TO_LANE_MISS:
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
