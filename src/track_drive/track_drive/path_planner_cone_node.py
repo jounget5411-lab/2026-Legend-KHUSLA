@@ -25,7 +25,7 @@ PLAN_HZ = 10
 
 # 콘 ROI
 CONE_X_MIN = 0.3
-CONE_X_MAX = 7.0
+CONE_X_MAX = 10.0
 CONE_Y_MIN = -6.0          # 곡선에서 양쪽 콘 다 잡히게 넓게
 CONE_Y_MAX = 6.0
 
@@ -43,7 +43,7 @@ FIT_SLOPE_MAX = 3.0        # |b| 제한
 LEFT_ACCEPT_DIST = 1.5     # (m) — 트랙폭 4.4m의 ~1/3, 오른쪽 콘은 2.2m+ 떨어져 걸러짐
 
 # 왼쪽 콘끼리 x 간격이 이 이상이면 먼 콘 버림 (끊긴 줄 잇지 않음)
-LEFT_MAX_X_GAP = 4.0       # (m)
+LEFT_MAX_X_GAP = 5.0       # (m) — 콘 간격 ~3m, 하나 놓치면 ~6m. 5m면 정상 커버.
 
 # 스무딩
 FIT_SMOOTH_ALPHA = 0.20    # 새 피팅 반영 비율
