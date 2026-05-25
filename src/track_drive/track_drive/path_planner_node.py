@@ -4,9 +4,9 @@
 
 WAIT: 정지. YOLO 초록불(GREEN=5) 감지 → CONE.
 CONE: 라바콘 주행 (왼쪽 콘 피팅 + 2.2m 오프셋). 콘 사라지면 → LANE.
-LANE: 차선 주행 (sm plan — 노란 중앙선 피팅). 나중에 예외 상태 추가.
+LANE: 차선 주행 — 친구 plan() 함수 그대로 (노란선 cls_id=8 기반).
 
-구독: /fused/obstacles, /fused/lane, /detect/events_raw, /auto_mode
+구독: /fused/obstacles, /fused/lane, /detect/events_raw
 발행: /center_path, /target, /lane_left, /lane_right
 """
 
@@ -14,16 +14,14 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
-from .common import LaneMemory, plan_drive_target
-
-# ======================== 공통 상수 ========================
-
-PLAN_HZ = 10
-TARGET_X = 3.0
-TARGET_Y_LIMIT = 4.0
+# 친구 plan() 함수 + 관련 헬퍼 전부 import
+from .lane_planner import plan as lane_plan
+from .lane_planner import (
+    YELLOW_CLS_IDS, WHITE_CLS_IDS, PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
+    _polyval_clipped, _sample_xs, _yellow_inlier_xs, _yellow_inlier_ys,
+)
 
 # ======================== CONE 상수 ========================
 
@@ -46,11 +44,8 @@ CONE_SAMPLE_X_START = 0.5
 CONE_SAMPLE_X_END = 6.0
 CONE_SAMPLE_N = 25
 
-# CONE→LANE 전환: 콘 miss가 이 이상 연속
-CONE_TO_LANE_MISS = 30          # 3초 연속 못 찾으면 전환
-CONE_GRACE_TICKS = 30           # CONE 진입 후 3초간 miss 카운트 안 함
-LANE_MIN_POINTS_FOR_SWITCH = 10
-
+CONE_TO_LANE_MISS = 30
+CONE_GRACE_TICKS = 30
 
 # ======================== WAIT 상수 ========================
 
@@ -70,6 +65,18 @@ def _poses_from_xy(stamp, xs, ys):
     return msg
 
 
+def _make_pose_array(stamp, xs, ys):
+    out = PoseArray()
+    out.header.stamp = stamp
+    out.header.frame_id = "lidar_frame"
+    for x, y in zip(xs, ys):
+        p = Pose()
+        p.position.x = float(x)
+        p.position.y = float(y)
+        out.poses.append(p)
+    return out
+
+
 # ======================== ROS 노드 ========================
 
 class PathPlannerNode(Node):
@@ -78,19 +85,21 @@ class PathPlannerNode(Node):
 
         self.phase = "WAIT"
 
-        # 데이터
+        # CONE 데이터
         self._obstacles = []
-        self._lane_xs = np.array([])
-        self._lane_ys = np.array([])
-        self._events = []  # YOLO event cls_id 리스트
-
-        # CONE 상태
         self._cone_prev_fit = None
         self._cone_miss = 0
         self._cone_grace = 0
 
-        # LANE 상태
-        self._lane_memory = LaneMemory()
+        # LANE 데이터 (친구 _on_lane과 동일 구조)
+        self._yellow_xs = np.array([], dtype=np.float64)
+        self._yellow_ys = np.array([], dtype=np.float64)
+        self._white_xs = np.array([], dtype=np.float64)
+        self._white_ys = np.array([], dtype=np.float64)
+        self._has_lane = False
+
+        # YOLO 이벤트
+        self._events = []
 
         # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
@@ -102,6 +111,7 @@ class PathPlannerNode(Node):
         self._pub_target = self.create_publisher(PointStamped, "/target", 10)
         self._pub_left = self.create_publisher(PoseArray, "/lane_left", 10)
         self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
+        self._pub_fits = self.create_publisher(PoseArray, "/lane_fits", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self._log_counter = 0
@@ -114,12 +124,26 @@ class PathPlannerNode(Node):
                            for p in msg.poses]
 
     def _on_lane(self, msg: PoseArray):
-        if msg.poses:
-            self._lane_xs = np.array([p.position.x for p in msg.poses], dtype=np.float64)
-            self._lane_ys = np.array([p.position.y for p in msg.poses], dtype=np.float64)
-        else:
-            self._lane_xs = np.array([])
-            self._lane_ys = np.array([])
+        """친구 path_planner_node._on_lane 그대로 — cls_id로 노란/흰 분리."""
+        self._has_lane = True
+        if not msg.poses:
+            self._yellow_xs = np.array([], dtype=np.float64)
+            self._yellow_ys = np.array([], dtype=np.float64)
+            self._white_xs = np.array([], dtype=np.float64)
+            self._white_ys = np.array([], dtype=np.float64)
+            return
+        xs = np.fromiter((p.position.x for p in msg.poses),
+                         dtype=np.float64, count=len(msg.poses))
+        ys = np.fromiter((p.position.y for p in msg.poses),
+                         dtype=np.float64, count=len(msg.poses))
+        cls = np.fromiter((int(p.position.z) for p in msg.poses),
+                          dtype=np.int32, count=len(msg.poses))
+        ym = np.isin(cls, list(YELLOW_CLS_IDS))
+        wm = np.isin(cls, list(WHITE_CLS_IDS))
+        self._yellow_xs = xs[ym]
+        self._yellow_ys = ys[ym]
+        self._white_xs = xs[wm]
+        self._white_ys = ys[wm]
 
     def _on_events(self, msg: PoseArray):
         self._events = [int(p.position.z) for p in msg.poses]
@@ -145,7 +169,6 @@ class PathPlannerNode(Node):
     # ---- WAIT ----
 
     def _tick_wait(self, stamp):
-        # 정지 — /center_path 발행 안 함 → motion이 정지
         if GREEN_CLS_ID in self._events:
             self.get_logger().info("GREEN detected → CONE")
             self.phase = "CONE"
@@ -164,18 +187,6 @@ class PathPlannerNode(Node):
                    & (all_y >= CONE_Y_MIN) & (all_y <= CONE_Y_MAX))
             all_x, all_y = all_x[roi], all_y[roi]
 
-        # 디버그 (1초마다)
-        self._log_counter += 1
-        do_log = self._log_counter >= PLAN_HZ
-        if do_log:
-            self._log_counter = 0
-            lcount = int(np.sum(all_y > 0)) if all_x.size > 0 else 0
-            self.get_logger().info(
-                f"[CONE] obs={all_x.size} left(y>0)={lcount} "
-                f"miss={self._cone_miss} grace={self._cone_grace} "
-                f"prev_fit={'Y' if self._cone_prev_fit is not None else 'N'}")
-
-        # 왼쪽 줄 추출
         left_fit = None
         if all_x.size >= CONE_FIT_MIN_POINTS:
             if self._cone_prev_fit is not None:
@@ -200,11 +211,9 @@ class PathPlannerNode(Node):
                     except (np.linalg.LinAlgError, ValueError):
                         pass
 
-        # grace period 카운트다운
         if self._cone_grace > 0:
             self._cone_grace -= 1
 
-        # EMA + miss
         if left_fit is None:
             if self._cone_grace <= 0:
                 self._cone_miss += 1
@@ -229,7 +238,6 @@ class PathPlannerNode(Node):
             left_fit = self._cone_prev_fit
             self._cone_miss = 0
 
-        # 중앙선
         center_coef = left_fit.copy()
         center_coef[2] -= TRACK_HALF_WIDTH
 
@@ -245,19 +253,40 @@ class PathPlannerNode(Node):
                                  -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
         self._publish_target(stamp, TARGET_X, target_y)
 
-    # ---- LANE ----
+    # ---- LANE (친구 plan() 그대로) ----
 
     def _tick_lane(self, stamp):
-        result = plan_drive_target(self._lane_xs, self._lane_ys, self._lane_memory)
-
-        if not result.ok:
+        if not self._has_lane:
             return
 
-        self._publish_target(stamp, result.target_x, result.target_y)
+        result = lane_plan(self._yellow_xs, self._yellow_ys,
+                           self._white_xs, self._white_ys,
+                           self._obstacles)
 
-        if result.path_xs is not None and len(result.path_xs) >= 2:
-            self._pub_center.publish(
-                _poses_from_xy(stamp, result.path_xs, result.path_ys))
+        if result is None:
+            return
+
+        target_x, target_y = result["target"]
+        sample_xs = result["sample_xs"]
+
+        self._publish_target(stamp, target_x, target_y)
+        self._pub_center.publish(_make_pose_array(stamp, sample_xs, result["sample_ys"]))
+        self._pub_left.publish(_make_pose_array(stamp, sample_xs, result["left_ys"]))
+        self._pub_right.publish(_make_pose_array(stamp, sample_xs, result["right_ys"]))
+
+        all_fits = result.get("all_fits", [])
+        if all_fits:
+            flat = PoseArray()
+            flat.header.stamp = stamp
+            flat.header.frame_id = "lidar_frame"
+            for coef in all_fits:
+                ys = _polyval_clipped(coef, sample_xs)
+                for x, y in zip(sample_xs, ys):
+                    p = Pose()
+                    p.position.x = float(x)
+                    p.position.y = float(y)
+                    flat.poses.append(p)
+            self._pub_fits.publish(flat)
 
     # ---- 공통 ----
 
