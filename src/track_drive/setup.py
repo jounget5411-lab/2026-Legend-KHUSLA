@@ -23,7 +23,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # 통합 파이프라인
+            # 메인 파이프라인
             'lane_detect = track_drive.lane_detect_node:main',
             'yolo_detect = track_drive.yolo_detect_node:main',
             'integration = track_drive.integration_node:main',
@@ -31,10 +31,6 @@ setup(
             'motion = track_drive.motion_node:main',
             'fused_viewer = track_drive.fused_viewer_node:main',
             'key_control = track_drive.key_control_node:main',
-            # 레거시
-            'path_planner_cone = track_drive.path_planner_cone_node:main',
-            'track_drive = track_drive.track_drive:main',
-            'calib_collect = track_drive.calib_collect:main',
         ],
     },
 )

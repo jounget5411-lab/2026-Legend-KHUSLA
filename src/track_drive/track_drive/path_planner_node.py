@@ -2,12 +2,24 @@
 """
 통합 경로계획 — 상태머신 WAIT → CONE → LANE.
 
-WAIT: 정지. YOLO 초록불(GREEN=5) 감지 → CONE.
-CONE: 라바콘 주행 (왼쪽 콘 피팅 + 2.2m 오프셋). 콘 사라지면 → LANE.
-LANE: 차선 주행 — 친구 plan() 함수 그대로 (노란선 cls_id=8 기반).
+상태:
+  WAIT: 정지. YOLO 초록불(GREEN=5) 감지 시 CONE으로 전환.
+  CONE: 라바콘 주행. 왼쪽 콘 줄 2차 피팅 + 2.2m 오프셋 = 중앙선.
+        콘 miss 30회(3초) 연속 시 LANE으로 전환.
+  LANE: 차선 주행. 노란 중앙선(cls_id=8) 기반 2차 피팅.
+        lane_planner.py의 plan() 함수 — 친구(sm) 원본 그대로.
 
-구독: /fused/obstacles, /fused/lane, /detect/events_raw
-발행: /center_path, /target, /lane_left, /lane_right
+구독:
+  /fused/obstacles  — 라이다 장애물 (CONE 모드용)
+  /fused/lane       — 차선 점 (LANE 모드용, z=cls_id: 8=노란, 6=흰)
+  /detect/events_raw — YOLO 이벤트 (WAIT에서 초록불 감지)
+
+발행:
+  /center_path  — 중앙 경로 (PoseArray, motion이 추종)
+  /target       — 목표점 (PointStamped)
+  /lane_left    — 좌측 경계 (시각화용)
+  /lane_right   — 우측 경계 (시각화용)
+  /lane_fits    — 피팅 결과 (LANE 모드 디버그용)
 """
 
 import numpy as np
@@ -16,7 +28,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
-# 친구 plan() 함수 + 관련 헬퍼 전부 import
+# LANE 모드: 친구 plan() + 헬퍼 (lane_planner.py = 친구 path_planner_node.py 원본)
 from .lane_planner import plan as lane_plan
 from .lane_planner import (
     YELLOW_CLS_IDS, WHITE_CLS_IDS, PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
@@ -24,12 +36,14 @@ from .lane_planner import (
 )
 
 # ======================== CONE 상수 ========================
+# 라바콘 구간: 라이다 /fused/obstacles에서 왼쪽 콘 줄을 피팅해
+# 트랙 절반(2.2m) 오프셋으로 중앙선을 만든다.
 
-CONE_X_MIN = 0.3
-CONE_X_MAX = 10.0
-CONE_Y_MIN = -6.0
+CONE_X_MIN = 0.3           # 전방 ROI 최소 (m)
+CONE_X_MAX = 10.0          # 전방 ROI 최대 (m)
+CONE_Y_MIN = -6.0          # 좌우 ROI (m)
 CONE_Y_MAX = 6.0
-TRACK_WIDTH = 4.4
+TRACK_WIDTH = 4.4           # 실측 트랙 폭 (m)
 TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
 
 CONE_FIT_MIN_POINTS = 2

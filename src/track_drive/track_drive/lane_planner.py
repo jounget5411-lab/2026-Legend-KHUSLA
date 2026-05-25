@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+[친구(sm) 원본 — 수정 금지] 차선 주행 plan() 함수 + 피팅 헬퍼.
+
+path_planner_node.py의 LANE 모드에서 plan()을 import해서 호출.
+이 파일은 친구 C:\\motion_node\\motion_node\\path_planner_node.py 와 동일.
+
+핵심: plan() → _fit_yellow_sliding() → 노란선(cls_id=8) 2차 피팅 → center_path.
+lane_detect_node가 OpenCV HSV로 노란/흰 분리해서 z=8/6 넣어줌.
+
 경로계획 노드 — YOLO 클래스(MID/LANE/CHILD_LANE)를 demux해 차선 선택 주행.
 
 구독:
