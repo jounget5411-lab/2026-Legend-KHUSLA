@@ -17,6 +17,13 @@ def generate_launch_description():
             description="Start fused_viewer_node GUI when true.",
         ),
 
+        # Unity 시뮬 브릿지
+        Node(
+            package="ros_tcp_endpoint",
+            executable="default_server_endpoint",
+            name="tcp_endpoint",
+            output="screen",
+        ),
         Node(
             package="track_drive",
             executable="lane_detect",
