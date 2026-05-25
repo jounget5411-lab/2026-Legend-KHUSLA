@@ -36,12 +36,19 @@ GROUND_H = np.array([
 # ======================== 라이다 파라미터 ========================
 
 LIDAR_RANGE_MIN = 0.1   # 최소 유효 거리 (m) — 차체 반사 제거
-LIDAR_RANGE_MAX = 12.0  # 최대 유효 거리 (m)
+LIDAR_RANGE_MAX = 14.0  # 최대 유효 거리 (m)
 
-# 장애물 ROI (lidar_frame 미터) — 튜닝 가능
+# 장애물 ROI (lidar_frame 미터) — ROI 최대로
 OBS_X_MIN = 0.1         # 전방 최소 (m)
-OBS_X_MAX = 8.0          # 전방 최대 (m)
-OBS_Y_HALF = 3.0         # 좌우 ± (m)
+OBS_X_MAX = 12.0        # 전방 최대 (m)
+OBS_Y_HALF = 5.0        # 좌우 ± (m)
+
+# 차선/정지선/출발선 sanity ROI (H 변환 후 lidar_frame 미터) — horizon 근처
+# 픽셀이 분모 0 근처를 지나며 발산값을 만들기 때문에 넓게 잡되 sanity 컷.
+LANE_X_MIN = 0.2
+LANE_X_MAX = 25.0
+LANE_Y_ABS_MAX = 12.0
+H_MIN_DENOM = 1e-4       # H 분모 절댓값 임계 — 이보다 작으면 horizon 발산이라 버림
 
 # 클러스터링 — 튜닝 가능
 CLUSTER_GAP = 0.35      # 인접 점 간 gap > 이 값이면 새 클러스터 (m)
@@ -58,16 +65,19 @@ CLS_GOAL = 4                # GOAL → /fused/goal
 def pixels_to_meters(us, vs):
     """원본 카메라 픽셀 배열 → lidar_frame 미터 (벡터화).
 
-    Returns (xs_fwd, ys_left) numpy 배열.
+    Returns (xs_fwd, ys_left, valid). valid는 H 분모가 horizon에서
+    충분히 떨어진 픽셀만 True.
     """
     n = len(us)
     if n == 0:
-        return np.array([]), np.array([])
+        empty = np.array([])
+        return empty, empty, np.array([], dtype=bool)
     pts = np.vstack([us, vs, np.ones(n)])  # (3, N)
     proj = GROUND_H @ pts                   # (3, N)
     w = proj[2]
-    w[w == 0] = 1e-12
-    return proj[0] / w, proj[1] / w
+    valid = np.abs(w) > H_MIN_DENOM
+    w_safe = np.where(valid, w, 1.0)
+    return proj[0] / w_safe, proj[1] / w_safe, valid
 
 
 # ======================== 장애물 클러스터링 ========================
@@ -124,35 +134,37 @@ class IntegrationNode(Node):
         self.get_logger().info("integration_node started (YOLO pixel H-transform)")
 
     def _on_road_pixels(self, msg: PoseArray):
+        stamp = msg.header.stamp
         if not msg.poses:
-            self._pub_lane.publish(_make_pose_array(msg.header.stamp, [], []))
+            self._pub_lane.publish(_make_pose_array(stamp, [], []))
             return
 
         us = np.array([p.position.x for p in msg.poses])
         vs = np.array([p.position.y for p in msg.poses])
         cls = np.array([int(p.position.z) for p in msg.poses])
 
-        # H 변환: 픽셀 → 미터 (전체 한 번에)
-        xs_fwd, ys_left = pixels_to_meters(us, vs)
+        xs_fwd, ys_left, valid = pixels_to_meters(us, vs)
 
-        stamp = msg.header.stamp
+        # horizon 발산 + 넓은 sanity ROI — 이걸 안 걸면 분모≈0 인 픽셀이
+        # 수십~수백 m로 튀어 topic을 오염시킨다.
+        sane = (valid
+                & (xs_fwd >= LANE_X_MIN)
+                & (xs_fwd <= LANE_X_MAX)
+                & (np.abs(ys_left) <= LANE_Y_ABS_MAX))
 
-        # 차선류 (LANE, MID, CHILD_LANE)
-        lane_mask = np.isin(cls, list(CLS_LANE_IDS))
+        lane_mask = np.isin(cls, list(CLS_LANE_IDS)) & sane
         if lane_mask.any():
             self._pub_lane.publish(_make_pose_array(
                 stamp, xs_fwd[lane_mask], ys_left[lane_mask], cls[lane_mask]))
         else:
             self._pub_lane.publish(_make_pose_array(stamp, [], []))
 
-        # 정지선 (STOP)
-        stop_mask = cls == CLS_STOP
+        stop_mask = (cls == CLS_STOP) & sane
         if stop_mask.any():
             self._pub_stop.publish(_make_pose_array(
                 stamp, xs_fwd[stop_mask], ys_left[stop_mask]))
 
-        # 출발/결승선 (GOAL)
-        goal_mask = cls == CLS_GOAL
+        goal_mask = (cls == CLS_GOAL) & sane
         if goal_mask.any():
             self._pub_goal.publish(_make_pose_array(
                 stamp, xs_fwd[goal_mask], ys_left[goal_mask]))
