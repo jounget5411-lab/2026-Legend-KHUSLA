@@ -308,24 +308,29 @@ class PathPlannerNode(Node):
                 return
 
     def _tick_pedestrian(self, stamp):
-        """정지 상태. 사람이 도로 밖으로 나가면 LANE 복귀."""
+        """정지 상태. 사람이 중앙선 왼쪽(y > center_y)으로 넘어가면 출발."""
         # center_path 발행 안 함 → motion 정지
         if self._lane_center_coef is None:
             self.phase = "LANE"
             return
 
-        ped_on_road = False
         for ox, oy, _r in self._obstacles:
             if ox > PED_X_MAX or ox < 0.3:
                 continue
+            if _r >= 0.4:
+                continue
             center_y = float(np.polyval(self._lane_center_coef, ox))
-            if abs(oy - center_y) <= PED_ROAD_HALF_WIDTH and _r < 0.4:
-                ped_on_road = True
-                break
+            if oy > center_y:
+                # 중앙선 왼쪽으로 넘어감 → 출발
+                self.get_logger().info("Pedestrian crossed center → LANE")
+                self.phase = "LANE"
+                return
+            # 아직 중앙선 오른쪽 → 계속 정지
+            return
 
-        if not ped_on_road:
-            self.get_logger().info("Pedestrian cleared → LANE")
-            self.phase = "LANE"
+        # 장애물 사라짐 → 출발
+        self.get_logger().info("Pedestrian gone → LANE")
+        self.phase = "LANE"
 
     # ---- LANE (친구 plan() 그대로) ----
 
