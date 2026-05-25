@@ -12,7 +12,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # launch 파일을 설치
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
@@ -24,21 +23,18 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'track_drive = track_drive.track_drive:main',
-            'calib_collect = track_drive.calib_collect:main',
+            # 통합 파이프라인
             'lane_detect = track_drive.lane_detect_node:main',
             'yolo_detect = track_drive.yolo_detect_node:main',
             'integration = track_drive.integration_node:main',
-            'fused_viewer = track_drive.fused_viewer_node:main',
             'path_planner = track_drive.path_planner_node:main',
-            'path_planner_cone = track_drive.path_planner_cone_node:main',
             'motion = track_drive.motion_node:main',
+            'fused_viewer = track_drive.fused_viewer_node:main',
             'key_control = track_drive.key_control_node:main',
-            'jh_yolo = track_drive.jh_yolo_detect_node:main',
-            'jh_integration = track_drive.jh_integration_node:main',
-            'jh_planner = track_drive.jh_path_planner_node:main',
-            'jh_motion = track_drive.jh_motion_node:main',
-            'jh_viewer = track_drive.jh_fused_viewer_node:main',
+            # 레거시
+            'path_planner_cone = track_drive.path_planner_cone_node:main',
+            'track_drive = track_drive.track_drive:main',
+            'calib_collect = track_drive.calib_collect:main',
         ],
     },
 )

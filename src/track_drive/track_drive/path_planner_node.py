@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-경로계획 노드 — 상태 머신 기반.
+통합 경로계획 — 상태머신 WAIT → CONE → LANE.
 
-구독: /fused/obstacles, /fused/lane, /auto_mode
-발행: /target (PointStamped), /planned_path (PoseArray)
+WAIT: 정지. YOLO 초록불(GREEN=5) 감지 → CONE.
+CONE: 라바콘 주행 (왼쪽 콘 피팅 + 2.2m 오프셋). 콘 사라지면 → LANE.
+LANE: 차선 주행 (sm plan — 노란 중앙선 피팅). 나중에 예외 상태 추가.
 
-상태: CONE → LANE → PEDESTRIAN → OVERTAKE → TURN → DONE
-현재 CONE만 구현. 나머지 placeholder.
+구독: /fused/obstacles, /fused/lane, /detect/events_raw, /auto_mode
+발행: /center_path, /target, /lane_left, /lane_right
 """
 
 import numpy as np
@@ -16,102 +17,69 @@ from rclpy.node import Node
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
-# ======================== 파라미터 ========================
+# ======================== 공통 상수 ========================
 
-PLAN_HZ = 10                # plan 주기 (Hz)
+PLAN_HZ = 10
+TARGET_X = 3.0
+TARGET_Y_LIMIT = 4.0
 
-# CONE 상태 파라미터
-TARGET_FORWARD_M = 1.5      # 목표점을 중앙선의 전방 몇 m 지점에서 잡을지
-FIT_MIN_PTS = 2             # 한쪽 줄 피팅에 필요한 최소 점 개수
-FIT_X_MIN = 0.3             # 피팅에 쓸 전방 최소 거리 (m)
-FIT_X_MAX = 7.0             # 피팅에 쓸 전방 최대 거리 (m)
-CENTER_SAMPLE_N = 30        # 중앙선 샘플 점 개수
-ONE_SIDE_OFFSET = 1.5       # 한쪽만 있을 때 반대쪽 추정용 오프셋 (m)
-DEFAULT_TARGET = (2.0, 0.0) # 데이터 부족 시 직진 목표
+# ======================== CONE 상수 ========================
 
-# ======================== CONE 로직 ========================
+CONE_X_MIN = 0.3
+CONE_X_MAX = 10.0
+CONE_Y_MIN = -6.0
+CONE_Y_MAX = 6.0
+TRACK_WIDTH = 4.4
+TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
 
-def plan_cone(obstacles):
-    """라바콘 두 줄 사이 중앙 경로 생성.
+CONE_FIT_MIN_POINTS = 2
+CONE_FIT_MIN_X_SPAN = 0.8
+CONE_FIT_CURVE_MAX = 1.5
+CONE_FIT_SLOPE_MAX = 3.0
+CONE_LEFT_ACCEPT_DIST = 1.5
+CONE_FIT_SMOOTH_ALPHA = 0.20
+CONE_FIT_MAX_MISS = 8
 
-    Parameters
-    ----------
-    obstacles : list of (x, y, r) — lidar_frame 미터
+CONE_SAMPLE_X_START = 0.5
+CONE_SAMPLE_X_END = 6.0
+CONE_SAMPLE_N = 25
 
-    Returns
-    -------
-    target : (x, y) or None
-    path   : list of (x, y) — 중앙 경로 전체 (viewer용)
-    """
-    if not obstacles:
-        return DEFAULT_TARGET, []
+# CONE→LANE 전환: 콘 miss가 이 이상 연속 + lane 점이 일정 이상
+CONE_TO_LANE_MISS = 10
+LANE_MIN_POINTS_FOR_SWITCH = 10
 
-    xs = np.array([o[0] for o in obstacles])
-    ys = np.array([o[1] for o in obstacles])
+# ======================== LANE 상수 (sm plan 간소화) ========================
 
-    roi = (xs >= FIT_X_MIN) & (xs <= FIT_X_MAX)
-    xs, ys = xs[roi], ys[roi]
+LANE_FIT_X_MIN = 0.5
+LANE_FIT_X_MAX = 12.0
+LANE_FIT_MIN_POINTS = 12
+LANE_FIT_MIN_X_SPAN = 0.75
+LANE_FIT_CURVE_MAX = 1.30
+LANE_FIT_SLOPE_MAX = 2.80
+LANE_HALF_WIDTH = 1.50
+LANE_SMOOTH_ALPHA = 0.28
+LANE_MAX_MISS = 6
+LANE_SAMPLE_X_MIN = 1.0
+LANE_SAMPLE_X_MAX = 11.0
+LANE_SAMPLE_COUNT = 13
+LANE_TARGET_SMOOTH_ALPHA = 0.22
 
-    left_mask = ys > 0
-    right_mask = ys < 0
-    lx, ly = xs[left_mask], ys[left_mask]
-    rx, ry = xs[right_mask], ys[right_mask]
+# ======================== WAIT 상수 ========================
 
-    have_left = len(lx) >= FIT_MIN_PTS
-    have_right = len(rx) >= FIT_MIN_PTS
+GREEN_CLS_ID = 5
 
-    if not have_left and not have_right:
-        return DEFAULT_TARGET, []
+# ======================== 헬퍼 ========================
 
-    x_min = max(FIT_X_MIN, min(xs))
-    x_max = min(FIT_X_MAX, max(xs))
-    sample_xs = np.linspace(x_min, x_max, CENTER_SAMPLE_N)
-
-    if have_left and have_right:
-        lcoef = np.polyfit(lx, ly, 2)
-        rcoef = np.polyfit(rx, ry, 2)
-        left_curve = np.polyval(lcoef, sample_xs)
-        right_curve = np.polyval(rcoef, sample_xs)
-        center_ys = (left_curve + right_curve) / 2.0
-    elif have_left:
-        lcoef = np.polyfit(lx, ly, 2)
-        left_curve = np.polyval(lcoef, sample_xs)
-        center_ys = left_curve - ONE_SIDE_OFFSET
-    else:
-        rcoef = np.polyfit(rx, ry, 2)
-        right_curve = np.polyval(rcoef, sample_xs)
-        center_ys = right_curve + ONE_SIDE_OFFSET
-
-    path = list(zip(sample_xs.tolist(), center_ys.tolist()))
-
-    # 목표점: 전방 TARGET_FORWARD_M 에 가장 가까운 중앙선 점
-    dists = np.abs(sample_xs - TARGET_FORWARD_M)
-    idx = int(np.argmin(dists))
-    target = (float(sample_xs[idx]), float(center_ys[idx]))
-
-    return target, path
-
-
-# ======================== placeholder 상태 함수 ========================
-
-def plan_lane(lane_xs, lane_ys, obstacles):
-    # 여기 나중에 차선 추종 구현
-    return DEFAULT_TARGET, []
-
-def plan_pedestrian(lane_xs, lane_ys, obstacles):
-    # 여기 나중에 보행자 대응 구현
-    return None, []
-
-def plan_overtake(lane_xs, lane_ys, obstacles):
-    # 여기 나중에 추월 구현
-    return DEFAULT_TARGET, []
-
-def plan_turn(lane_xs, lane_ys, obstacles):
-    # 여기 나중에 회전 구현
-    return DEFAULT_TARGET, []
-
-def plan_done():
-    return None, []
+def _poses_from_xy(stamp, xs, ys):
+    msg = PoseArray()
+    msg.header.stamp = stamp
+    msg.header.frame_id = "lidar_frame"
+    for x, y in zip(xs, ys):
+        p = Pose()
+        p.position.x = float(x)
+        p.position.y = float(y)
+        msg.poses.append(p)
+    return msg
 
 
 # ======================== ROS 노드 ========================
@@ -120,76 +88,239 @@ class PathPlannerNode(Node):
     def __init__(self):
         super().__init__("path_planner_node")
 
-        self.state = "CONE"
-        self._auto_mode = False
+        self.phase = "WAIT"
+        self._auto = False
 
+        # 데이터
+        self._obstacles = []
         self._lane_xs = np.array([])
         self._lane_ys = np.array([])
-        self._obstacles = []
+        self._events = []  # YOLO event cls_id 리스트
 
-        self.create_subscription(PoseArray, "/fused/lane", self._on_lane, 10)
+        # CONE 상태
+        self._cone_prev_fit = None
+        self._cone_miss = 0
+
+        # LANE 상태
+        self._lane_prev_fit = None
+        self._lane_miss = 0
+        self._lane_prev_target_y = 0.0
+
+        # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
+        self.create_subscription(PoseArray, "/fused/lane", self._on_lane, 10)
+        self.create_subscription(PoseArray, "/detect/events_raw", self._on_events, 10)
         self.create_subscription(Bool, "/auto_mode", self._on_auto, 10)
 
+        # 발행
+        self._pub_center = self.create_publisher(PoseArray, "/center_path", 10)
         self._pub_target = self.create_publisher(PointStamped, "/target", 10)
-        self._pub_path = self.create_publisher(PoseArray, "/planned_path", 10)
+        self._pub_left = self.create_publisher(PoseArray, "/lane_left", 10)
+        self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
-        self.get_logger().info(f"path_planner_node started — state={self.state}, auto=OFF")
+        self._log_counter = 0
+        self.get_logger().info("path_planner_node started (WAIT→CONE→LANE)")
 
-    def _on_lane(self, msg: PoseArray):
-        self._lane_xs = np.array([p.position.x for p in msg.poses], dtype=np.float64)
-        self._lane_ys = np.array([p.position.y for p in msg.poses], dtype=np.float64)
+    # ---- 콜백 ----
 
     def _on_obs(self, msg: PoseArray):
-        self._obstacles = [(p.position.x, p.position.y, p.position.z) for p in msg.poses]
+        self._obstacles = [(p.position.x, p.position.y, p.position.z)
+                           for p in msg.poses]
+
+    def _on_lane(self, msg: PoseArray):
+        if msg.poses:
+            self._lane_xs = np.array([p.position.x for p in msg.poses], dtype=np.float64)
+            self._lane_ys = np.array([p.position.y for p in msg.poses], dtype=np.float64)
+        else:
+            self._lane_xs = np.array([])
+            self._lane_ys = np.array([])
+
+    def _on_events(self, msg: PoseArray):
+        self._events = [int(p.position.z) for p in msg.poses]
 
     def _on_auto(self, msg: Bool):
-        prev = self._auto_mode
-        self._auto_mode = msg.data
-        if prev != self._auto_mode:
-            self.get_logger().info(f"auto_mode = {'ON' if self._auto_mode else 'OFF'}")
+        if self._auto != msg.data:
+            self._auto = msg.data
+            self.get_logger().info(f"auto_mode = {'ON' if self._auto else 'OFF'}")
+
+    # ---- 메인 틱 ----
 
     def _tick(self):
-        if not self._auto_mode:
+        if not self._auto:
             return
 
-        # 상태 머신 디스패치
-        if self.state == "CONE":
-            target, path = plan_cone(self._obstacles)
-        elif self.state == "LANE":
-            target, path = plan_lane(self._lane_xs, self._lane_ys, self._obstacles)
-        elif self.state == "PEDESTRIAN":
-            target, path = plan_pedestrian(self._lane_xs, self._lane_ys, self._obstacles)
-        elif self.state == "OVERTAKE":
-            target, path = plan_overtake(self._lane_xs, self._lane_ys, self._obstacles)
-        elif self.state == "TURN":
-            target, path = plan_turn(self._lane_xs, self._lane_ys, self._obstacles)
-        elif self.state == "DONE":
-            target, path = plan_done()
+        stamp = self.get_clock().now().to_msg()
+
+        if self.phase == "WAIT":
+            self._tick_wait(stamp)
+        elif self.phase == "CONE":
+            self._tick_cone(stamp)
+        elif self.phase == "LANE":
+            self._tick_lane(stamp)
+
+        # 로그
+        self._log_counter += 1
+        if self._log_counter >= PLAN_HZ:
+            self._log_counter = 0
+            self.get_logger().info(f"phase={self.phase}")
+
+    # ---- WAIT ----
+
+    def _tick_wait(self, stamp):
+        # 정지 — /center_path 발행 안 함 → motion이 정지
+        if GREEN_CLS_ID in self._events:
+            self.get_logger().info("GREEN detected → CONE")
+            self.phase = "CONE"
+
+    # ---- CONE ----
+
+    def _tick_cone(self, stamp):
+        sample_xs = np.linspace(CONE_SAMPLE_X_START, CONE_SAMPLE_X_END, CONE_SAMPLE_N)
+
+        all_x = np.array([o[0] for o in self._obstacles])
+        all_y = np.array([o[1] for o in self._obstacles])
+        if all_x.size > 0:
+            roi = ((all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
+                   & (all_y >= CONE_Y_MIN) & (all_y <= CONE_Y_MAX))
+            all_x, all_y = all_x[roi], all_y[roi]
+
+        # 왼쪽 줄 추출
+        left_fit = None
+        if all_x.size >= CONE_FIT_MIN_POINTS:
+            if self._cone_prev_fit is not None:
+                expected_y = np.polyval(self._cone_prev_fit, all_x)
+                left_mask = np.abs(all_y - expected_y) < CONE_LEFT_ACCEPT_DIST
+            else:
+                left_mask = all_y > 0
+
+            lx, ly = all_x[left_mask], all_y[left_mask]
+            if lx.size >= CONE_FIT_MIN_POINTS:
+                x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
+                if x_span >= CONE_FIT_MIN_X_SPAN:
+                    try:
+                        deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
+                        w = 1.0 / (1.0 + lx * lx)
+                        coef = np.polyfit(lx, ly, deg, w=w)
+                        if deg == 1:
+                            coef = np.array([0.0, coef[0], coef[1]])
+                        a, b, _ = coef
+                        if abs(a) <= CONE_FIT_CURVE_MAX and abs(b) <= CONE_FIT_SLOPE_MAX:
+                            left_fit = coef
+                    except (np.linalg.LinAlgError, ValueError):
+                        pass
+
+        # EMA + miss
+        if left_fit is None:
+            self._cone_miss += 1
+            if self._cone_prev_fit is not None and self._cone_miss <= CONE_FIT_MAX_MISS:
+                prev = self._cone_prev_fit.copy()
+                prev[0] *= max(0.0, 1.0 - self._cone_miss * 0.2)
+                left_fit = prev
+            else:
+                self._cone_prev_fit = None
+                # 전환 체크
+                if self._cone_miss >= CONE_TO_LANE_MISS:
+                    self.get_logger().info(
+                        f"cones gone (miss={self._cone_miss}) → LANE")
+                    self.phase = "LANE"
+                return
         else:
-            target, path = DEFAULT_TARGET, []
+            if self._cone_prev_fit is None:
+                self._cone_prev_fit = np.asarray(left_fit, dtype=np.float64)
+            else:
+                self._cone_prev_fit = (
+                    (1.0 - CONE_FIT_SMOOTH_ALPHA) * self._cone_prev_fit
+                    + CONE_FIT_SMOOTH_ALPHA * np.asarray(left_fit, dtype=np.float64))
+            left_fit = self._cone_prev_fit
+            self._cone_miss = 0
 
-        # 여기 나중에 상태 전환 조건 (CONE→LANE 등)
+        # 중앙선
+        center_coef = left_fit.copy()
+        center_coef[2] -= TRACK_HALF_WIDTH
 
-        if target is not None:
-            msg = PointStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "lidar_frame"
-            msg.point.x = float(target[0])
-            msg.point.y = float(target[1])
-            self._pub_target.publish(msg)
+        left_ys = np.polyval(left_fit, sample_xs)
+        center_ys = np.clip(np.polyval(center_coef, sample_xs), -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+        right_ys = center_ys - TRACK_HALF_WIDTH
 
-        if path:
-            msg = PoseArray()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "lidar_frame"
-            for x, y in path:
-                p = Pose()
-                p.position.x = float(x)
-                p.position.y = float(y)
-                msg.poses.append(p)
-            self._pub_path.publish(msg)
+        self._pub_left.publish(_poses_from_xy(stamp, sample_xs, left_ys))
+        self._pub_right.publish(_poses_from_xy(stamp, sample_xs, right_ys))
+        self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
+
+        target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
+                                 -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
+        self._publish_target(stamp, TARGET_X, target_y)
+
+    # ---- LANE ----
+
+    def _tick_lane(self, stamp):
+        xs = self._lane_xs
+        ys = self._lane_ys
+
+        # ROI
+        if xs.size > 0:
+            roi = ((xs > LANE_FIT_X_MIN) & (xs < LANE_FIT_X_MAX)
+                   & (np.abs(ys) < TARGET_Y_LIMIT))
+            xs, ys = xs[roi], ys[roi]
+
+        lane_fit = None
+        if (xs.size >= LANE_FIT_MIN_POINTS
+                and float(np.max(xs) - np.min(xs)) >= LANE_FIT_MIN_X_SPAN):
+            try:
+                w = 1.0 / (1.0 + xs * xs)
+                coef = np.polyfit(xs, ys, 2, w=w)
+                a, b, _ = coef
+                if abs(a) <= LANE_FIT_CURVE_MAX and abs(b) <= LANE_FIT_SLOPE_MAX:
+                    lane_fit = coef
+            except (np.linalg.LinAlgError, ValueError):
+                pass
+
+        # EMA + miss
+        if lane_fit is None:
+            self._lane_miss += 1
+            if self._lane_prev_fit is not None and self._lane_miss <= LANE_MAX_MISS:
+                lane_fit = self._lane_prev_fit
+            else:
+                self._lane_prev_fit = None
+                return
+        else:
+            if self._lane_prev_fit is None:
+                self._lane_prev_fit = np.asarray(lane_fit, dtype=np.float64)
+            else:
+                self._lane_prev_fit = (
+                    (1.0 - LANE_SMOOTH_ALPHA) * self._lane_prev_fit
+                    + LANE_SMOOTH_ALPHA * np.asarray(lane_fit, dtype=np.float64))
+            lane_fit = self._lane_prev_fit
+            self._lane_miss = 0
+
+        sample_xs = np.linspace(LANE_SAMPLE_X_MIN, LANE_SAMPLE_X_MAX, LANE_SAMPLE_COUNT)
+        center_ys = np.clip(np.polyval(lane_fit, sample_xs), -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+
+        left_coef = lane_fit.copy(); left_coef[2] += LANE_HALF_WIDTH
+        right_coef = lane_fit.copy(); right_coef[2] -= LANE_HALF_WIDTH
+
+        self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
+        self._pub_left.publish(_poses_from_xy(stamp, sample_xs,
+                               np.polyval(left_coef, sample_xs)))
+        self._pub_right.publish(_poses_from_xy(stamp, sample_xs,
+                                np.polyval(right_coef, sample_xs)))
+
+        raw_y = float(np.clip(np.polyval(lane_fit, TARGET_X),
+                              -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
+        delta = raw_y - self._lane_prev_target_y
+        target_y = self._lane_prev_target_y + LANE_TARGET_SMOOTH_ALPHA * delta
+        self._lane_prev_target_y = target_y
+        self._publish_target(stamp, TARGET_X, target_y)
+
+    # ---- 공통 ----
+
+    def _publish_target(self, stamp, x, y):
+        t = PointStamped()
+        t.header.stamp = stamp
+        t.header.frame_id = "lidar_frame"
+        t.point.x = float(x)
+        t.point.y = float(y)
+        self._pub_target.publish(t)
 
 
 def main(args=None):
