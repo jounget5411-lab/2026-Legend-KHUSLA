@@ -73,9 +73,11 @@ CHILD_END_CLS_ID = 1
 # ======================== 사람 감지 (PEDESTRIAN) ========================
 
 PED_X_MAX = 8.0             # 전방 이 거리 이내
-PED_ROAD_HALF_WIDTH = 2.0   # center_path 기준 ± 이 폭 안에 있으면 "도로 안"
+PED_ROAD_HALF_WIDTH = 1.5   # center_path 기준 ± 이 폭 (좁게 — 나무 제외)
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
 PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
+PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
+PED_CAR_SPREAD = 1.5        # 클러스터 간 거리 이 이내면 밀집 (차)
 
 # ======================== 헬퍼 ========================
 
@@ -298,28 +300,43 @@ class PathPlannerNode(Node):
     # ---- PEDESTRIAN: 사람 감지 → 정지 → 도로 밖으로 나가면 출발 ----
 
     def _check_pedestrian(self):
-        """LANE 주행 중 도로 안에 사람(작은 장애물) 있으면 정지."""
+        """LANE 주행 중 도로 안에 사람(작은 장애물) 있으면 정지. 밀집 클러스터면 차→무시."""
         if self._ped_cooldown > 0:
             self._ped_cooldown -= 1
             return
         if self._lane_center_coef is None:
             return
 
+        # 도로 안 클러스터 모으기
+        road_obs = []
         for ox, oy, _r in self._obstacles:
             if ox > PED_X_MAX or ox < 0.3:
                 continue
             center_y = float(np.polyval(self._lane_center_coef, ox))
-            if abs(oy - center_y) > PED_ROAD_HALF_WIDTH:
-                continue
-            # 도로 안, 8m 이내 — 클러스터 크기로 사람/차 구분
-            # _r은 클러스터 반경인데, 점 수는 직접 못 봄. 반경으로 대체:
-            # 사람은 작음(r < 0.3), 차는 큼(r > 0.5)
-            if _r < 0.4:
-                self.get_logger().info(
-                    f"PEDESTRIAN detected at ({ox:.1f},{oy:.1f}) r={_r:.2f} → STOP")
-                self._ped_timer = PED_MIN_STOP_TICKS
-                self.phase = "PEDESTRIAN"
-                return
+            if abs(oy - center_y) <= PED_ROAD_HALF_WIDTH:
+                road_obs.append((ox, oy, _r))
+
+        if not road_obs:
+            return
+
+        # 밀집 판단: 도로 안 클러스터끼리 거리 PED_CAR_SPREAD 이내로 모여있으면 차
+        # 서로 가까운 클러스터 개수 세기
+        dense_count = 0
+        for i, (x1, y1, _) in enumerate(road_obs):
+            for x2, y2, _ in road_obs[i+1:]:
+                if abs(x1 - x2) + abs(y1 - y2) < PED_CAR_SPREAD:
+                    dense_count += 1
+
+        if len(road_obs) >= PED_CAR_CLUSTER_COUNT and dense_count >= 2:
+            return  # 밀집 클러스터 여러 개 = 차 → 무시 (친구 추월 담당)
+
+        # 사람: 도로 안 클러스터 1~2개, 밀집 아님
+        ox, oy, _r = road_obs[0]
+        self.get_logger().info(
+            f"PEDESTRIAN detected at ({ox:.1f},{oy:.1f}) "
+            f"road_obs={len(road_obs)} dense={dense_count} → STOP")
+        self._ped_timer = PED_MIN_STOP_TICKS
+        self.phase = "PEDESTRIAN"
 
     def _tick_pedestrian(self, stamp):
         """정지. 최소 3초 정지 후, 도로 안 작은 장애물 없으면 출발."""
