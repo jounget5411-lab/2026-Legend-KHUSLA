@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-라바콘 경로계획 노드 — 라인 추적(tracking) 기반 좌우 분류.
+라바콘 경로계획 노드 — 왼쪽 콘 줄 피팅 + 오프셋 방식.
 
-콘 좌우를 y부호가 아니라 "이전 좌/우 라인과의 거리"로 배정.
-한 번 오른쪽으로 잡힌 라인은 곡선에서도 오른쪽 유지.
+친구 차선 로직과 동일 구조:
+  왼쪽 콘 줄 = 노란 중앙선 역할 → 2차 피팅 → +TRACK_HALF_WIDTH 오프셋 = center_path
+  EMA 스무딩으로 안정화. miss 카운터로 일시 누락 유지.
 
 구독: /fused/obstacles, /auto_mode, /measure_width
 발행: /center_path, /target, /lane_left, /lane_right
@@ -22,85 +23,44 @@ from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
 PLAN_HZ = 10
 
+# 콘 ROI
 CONE_X_MIN = 0.3
 CONE_X_MAX = 7.0
+CONE_Y_MIN = -1.0          # 왼쪽 콘은 대체로 y>0 이지만 곡선 여유
+CONE_Y_MAX = 6.0
 
+# 트랙 폭
 TRACK_WIDTH = 4.4
-TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
+TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0   # 2.2m — 왼쪽 줄에서 중앙까지
 
-GATE_X_TOL = 1.5
-GATE_WIDTH_MIN = 3.0
-GATE_WIDTH_MAX = 6.0
+# 피팅
+FIT_MIN_POINTS = 3
+FIT_MIN_X_SPAN = 0.8
+FIT_CURVE_MAX = 1.5        # |a| 제한 (2차 계수)
+FIT_SLOPE_MAX = 3.0        # |b| 제한
 
-FIT_MIN_PTS_QUAD = 4
-FIT_MIN_PTS_LIN = 2
+# 왼쪽 콘 = y가 가장 큰 쪽. 양쪽 콘이 섞여있을 때 왼쪽만 골라야 함.
+# "모든 콘 중 y가 큰 절반"을 왼쪽 줄로 간주 (단순하고 곡선에서도 동작).
+LEFT_FRACTION = 0.5
 
+# 스무딩
+FIT_SMOOTH_ALPHA = 0.30    # 새 피팅 반영 비율 (친구 YELLOW_FIT_SMOOTH_ALPHA와 동일)
+FIT_MAX_MISS = 8           # 피팅 실패 시 이전 유지 최대 프레임
+
+# 중앙선 샘플
 SAMPLE_X_START = 0.5
 SAMPLE_X_END = 6.0
 SAMPLE_N = 25
 
-TARGET_FORWARD_M = 1.5
-MEMORY_MAX_TICKS = 15
-PATH_SMOOTH_ALPHA = 0.7
+# 목표점
+TARGET_X = 3.0             # 친구 motion과 맞춤
+TARGET_Y_LIMIT = 4.0
 
+# 폭 측정
 WIDTH_MEASURE_XS = [1.0, 2.0, 3.0, 4.0, 5.0]
 WIDTH_COLLECT_FRAMES = 15
 
-# ======================== 게이트 매칭 ========================
-
-def _find_gates_and_singles(xs, ys):
-    n = len(xs)
-    if n == 0:
-        return [], []
-    order = np.argsort(xs)
-    sx, sy = xs[order], ys[order]
-    used = [False] * n
-    gates = []
-    for i in range(n):
-        if used[i]:
-            continue
-        best_j = -1
-        best_width = 0.0
-        for j in range(i + 1, n):
-            if used[j]:
-                continue
-            dx = abs(sx[j] - sx[i])
-            if dx > GATE_X_TOL:
-                break
-            dy = abs(sy[j] - sy[i])
-            if GATE_WIDTH_MIN <= dy <= GATE_WIDTH_MAX:
-                if best_j < 0 or abs(dy - TRACK_WIDTH) < abs(best_width - TRACK_WIDTH):
-                    best_j = j
-                    best_width = dy
-        if best_j >= 0:
-            used[i] = True
-            used[best_j] = True
-            mx = (sx[i] + sx[best_j]) / 2.0
-            my = (sy[i] + sy[best_j]) / 2.0
-            ya, yb = sy[i], sy[best_j]
-            if ya < yb:
-                ya, yb = yb, ya
-            gates.append((mx, my, ya, yb))
-    singles = [(sx[i], sy[i]) for i in range(n) if not used[i]]
-    return gates, singles
-
-
 # ======================== 헬퍼 ========================
-
-def _fit_curve(xs, ys):
-    n = len(xs)
-    if n >= FIT_MIN_PTS_QUAD:
-        try:
-            return 2, np.polyfit(xs, ys, 2)
-        except (np.linalg.LinAlgError, ValueError):
-            pass
-    if n >= FIT_MIN_PTS_LIN:
-        try:
-            return 1, np.polyfit(xs, ys, 1)
-        except (np.linalg.LinAlgError, ValueError):
-            pass
-    return None
-
 
 def _poses_from_xy(stamp, xs, ys):
     msg = PoseArray()
@@ -114,34 +74,6 @@ def _poses_from_xy(stamp, xs, ys):
     return msg
 
 
-# ======================== 콘→좌/우 배정 (라인 추적) ========================
-
-def _assign_cones_by_tracking(all_x, all_y, prev_left_coef, prev_right_coef):
-    """이전 좌/우 라인 coef 기준으로 각 콘을 가까운 쪽에 배정.
-
-    이전 라인 없으면 y부호로 초기 분류 (첫 프레임 전용).
-    """
-    lx, ly, rx, ry = [], [], [], []
-
-    have_prev = prev_left_coef is not None and prev_right_coef is not None
-
-    for x, y in zip(all_x, all_y):
-        if have_prev:
-            dl = abs(y - np.polyval(prev_left_coef, x))
-            dr = abs(y - np.polyval(prev_right_coef, x))
-            if dl < dr:
-                lx.append(x); ly.append(y)
-            else:
-                rx.append(x); ry.append(y)
-        else:
-            if y > 0:
-                lx.append(x); ly.append(y)
-            else:
-                rx.append(x); ry.append(y)
-
-    return (np.array(lx), np.array(ly), np.array(rx), np.array(ry))
-
-
 # ======================== ROS 노드 ========================
 
 class PathPlannerConeNode(Node):
@@ -150,10 +82,8 @@ class PathPlannerConeNode(Node):
 
         self._auto = False
         self._obstacles = []
-        self._prev_center_ys = None
-        self._prev_left_coef = None
-        self._prev_right_coef = None
-        self._stale_ticks = 999
+        self._prev_left_fit = None     # 왼쪽 줄 EMA 피팅 계수
+        self._miss_count = 0
         self._width_collecting = 0
         self._width_samples = []
         self._log_counter = 0
@@ -171,8 +101,7 @@ class PathPlannerConeNode(Node):
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self.get_logger().info(
-            f"path_planner_cone (tracking, width={TRACK_WIDTH:.1f}m, "
-            f"smooth={PATH_SMOOTH_ALPHA}, auto=OFF)")
+            f"path_planner_cone (left-fit+offset, width={TRACK_WIDTH:.1f}m, auto=OFF)")
 
     def _on_obs(self, msg: PoseArray):
         self._obstacles = [(p.position.x, p.position.y, p.position.z)
@@ -196,132 +125,108 @@ class PathPlannerConeNode(Node):
         stamp = self.get_clock().now().to_msg()
         sample_xs = self._sample_xs
 
+        # ROI 필터
         all_x = np.array([o[0] for o in self._obstacles])
         all_y = np.array([o[1] for o in self._obstacles])
         if all_x.size > 0:
-            roi = (all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
+            roi = ((all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
+                   & (all_y >= CONE_Y_MIN) & (all_y <= CONE_Y_MAX))
             all_x, all_y = all_x[roi], all_y[roi]
 
-        if all_x.size == 0:
-            self._do_memory(stamp)
-            return
+        # 왼쪽 줄 추출: y가 큰 쪽 절반
+        left_fit = None
+        if all_x.size >= FIT_MIN_POINTS:
+            y_median = float(np.median(all_y))
+            left_mask = all_y >= y_median
+            lx, ly = all_x[left_mask], all_y[left_mask]
 
-        # ---- 콘 좌/우 배정 (라인 추적) ----
-        lx, ly, rx, ry = _assign_cones_by_tracking(
-            all_x, all_y, self._prev_left_coef, self._prev_right_coef)
+            if (lx.size >= FIT_MIN_POINTS
+                    and float(np.max(lx) - np.min(lx)) >= FIT_MIN_X_SPAN):
+                try:
+                    w = 1.0 / (1.0 + lx * lx)
+                    coef = np.polyfit(lx, ly, 2, w=w)
+                    a, b, _ = coef
+                    if abs(a) <= FIT_CURVE_MAX and abs(b) <= FIT_SLOPE_MAX:
+                        left_fit = coef
+                except (np.linalg.LinAlgError, ValueError):
+                    pass
 
-        n_left, n_right = len(lx), len(rx)
-
-        # ---- 좌/우 각각 피팅 ----
-        l_fit = _fit_curve(lx, ly) if n_left >= FIT_MIN_PTS_LIN else None
-        r_fit = _fit_curve(rx, ry) if n_right >= FIT_MIN_PTS_LIN else None
-
-        have_left = l_fit is not None
-        have_right = r_fit is not None
-
-        if have_left and have_right:
-            l_deg, l_coef = l_fit
-            r_deg, r_coef = r_fit
-            l_ys = np.polyval(l_coef, sample_xs)
-            r_ys = np.polyval(r_coef, sample_xs)
-            raw_center_ys = (l_ys + r_ys) / 2.0
-            self._prev_left_coef = l_coef
-            self._prev_right_coef = r_coef
-            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
-            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
-            mode = f"both L{n_left}/R{n_right} deg={l_deg},{r_deg}"
-
-        elif have_left:
-            _, l_coef = l_fit
-            l_ys = np.polyval(l_coef, sample_xs)
-            raw_center_ys = l_ys - TRACK_HALF_WIDTH
-            self._prev_left_coef = l_coef
-            if self._prev_right_coef is None:
-                self._prev_right_coef = np.array([c for c in l_coef])
-                self._prev_right_coef[-1] -= TRACK_WIDTH
-            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
-            r_ys = raw_center_ys - TRACK_HALF_WIDTH
-            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
-            mode = f"left-only L{n_left}"
-
-        elif have_right:
-            _, r_coef = r_fit
-            r_ys = np.polyval(r_coef, sample_xs)
-            raw_center_ys = r_ys + TRACK_HALF_WIDTH
-            self._prev_right_coef = r_coef
-            if self._prev_left_coef is None:
-                self._prev_left_coef = np.array([c for c in r_coef])
-                self._prev_left_coef[-1] += TRACK_WIDTH
-            l_ys = raw_center_ys + TRACK_HALF_WIDTH
-            self._pub_left.publish(_poses_from_xy(stamp, sample_xs, l_ys))
-            self._pub_right.publish(_poses_from_xy(stamp, sample_xs, r_ys))
-            mode = f"right-only R{n_right}"
-
+        # EMA 스무딩 + miss 유지 (친구 _fit_yellow_sliding 구조)
+        if left_fit is None:
+            self._miss_count += 1
+            if self._prev_left_fit is not None and self._miss_count <= FIT_MAX_MISS:
+                left_fit = self._prev_left_fit
+            else:
+                self._prev_left_fit = None
+                return
         else:
-            self._do_memory(stamp)
-            return
+            if self._prev_left_fit is None:
+                self._prev_left_fit = np.asarray(left_fit, dtype=np.float64)
+            else:
+                self._prev_left_fit = (
+                    (1.0 - FIT_SMOOTH_ALPHA) * self._prev_left_fit
+                    + FIT_SMOOTH_ALPHA * np.asarray(left_fit, dtype=np.float64))
+            left_fit = self._prev_left_fit
+            self._miss_count = 0
 
-        # ---- EMA 안정화 ----
-        if self._prev_center_ys is not None and len(self._prev_center_ys) == SAMPLE_N:
-            center_ys = PATH_SMOOTH_ALPHA * self._prev_center_ys + \
-                        (1.0 - PATH_SMOOTH_ALPHA) * raw_center_ys
-        else:
-            center_ys = raw_center_ys
+        # 중앙선 = 왼쪽 줄 - TRACK_HALF_WIDTH
+        center_coef = left_fit.copy()
+        center_coef[2] -= TRACK_HALF_WIDTH
 
-        self._prev_center_ys = center_ys
-        self._stale_ticks = 0
+        left_ys = np.polyval(left_fit, sample_xs)
+        center_ys = np.polyval(center_coef, sample_xs)
+        right_ys = center_ys - TRACK_HALF_WIDTH
 
+        center_ys = np.clip(center_ys, -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+
+        # 발행
+        self._pub_left.publish(_poses_from_xy(stamp, sample_xs, left_ys))
+        self._pub_right.publish(_poses_from_xy(stamp, sample_xs, right_ys))
         self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
-        idx = int(np.argmin(np.abs(sample_xs - TARGET_FORWARD_M)))
-        self._publish_target(stamp, sample_xs[idx], center_ys[idx])
+
+        target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
+                                 -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
+        t = PointStamped()
+        t.header.stamp = stamp
+        t.header.frame_id = "lidar_frame"
+        t.point.x = float(TARGET_X)
+        t.point.y = target_y
+        self._pub_target.publish(t)
 
         self._log_counter += 1
         if self._log_counter >= PLAN_HZ:
             self._log_counter = 0
-            trk = "tracked" if self._prev_left_coef is not None else "init"
-            self.get_logger().info(f"{mode} [{trk}]")
-
-    def _do_memory(self, stamp):
-        self._stale_ticks += 1
-        if self._prev_center_ys is not None and self._stale_ticks < MEMORY_MAX_TICKS:
-            sample_xs = self._sample_xs
-            self._pub_center.publish(_poses_from_xy(stamp, sample_xs, self._prev_center_ys))
-            idx = int(np.argmin(np.abs(sample_xs - TARGET_FORWARD_M)))
-            self._publish_target(stamp, sample_xs[idx], self._prev_center_ys[idx])
-
-    def _publish_target(self, stamp, x, y):
-        t = PointStamped()
-        t.header.stamp = stamp
-        t.header.frame_id = "lidar_frame"
-        t.point.x = float(x)
-        t.point.y = float(y)
-        self._pub_target.publish(t)
+            n_cones = all_x.size
+            self.get_logger().info(
+                f"cones={n_cones} left_fit={'ok' if left_fit is not None else 'miss'} "
+                f"target_y={target_y:+.2f}")
 
     def _tick_width_measure(self):
         if self._width_collecting <= 0:
             return
         all_x = np.array([o[0] for o in self._obstacles])
         all_y = np.array([o[1] for o in self._obstacles])
-        if all_x.size == 0:
+        if all_x.size < 4:
             self._width_collecting -= 1
             return
         roi = (all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
         all_x, all_y = all_x[roi], all_y[roi]
-        gates, _ = _find_gates_and_singles(all_x, all_y)
-        if gates:
-            widths = [abs(ya - yb) for _, _, ya, yb in gates]
-            self._width_samples.append((float(np.mean(widths)), len(gates)))
+        if all_x.size >= 4:
+            y_med = np.median(all_y)
+            ly = all_y[all_y >= y_med]
+            ry = all_y[all_y < y_med]
+            if ly.size >= 1 and ry.size >= 1:
+                w = float(np.mean(ly) - np.mean(ry))
+                self._width_samples.append(w)
         self._width_collecting -= 1
         if self._width_collecting == 0:
             if self._width_samples:
-                ws = [s[0] for s in self._width_samples]
-                avg_w = float(np.mean(ws))
-                total_gates = sum(s[1] for s in self._width_samples)
+                avg_w = float(np.mean(self._width_samples))
                 self.get_logger().info(
                     f"track width: {avg_w:.2f} m (half: {avg_w/2:.2f} m), "
-                    f"{total_gates} gates over {len(ws)} frames")
+                    f"{len(self._width_samples)} frames")
             else:
-                self.get_logger().warn("width measurement FAILED — no gates found.")
+                self.get_logger().warn("width measurement FAILED")
 
 
 def main(args=None):
