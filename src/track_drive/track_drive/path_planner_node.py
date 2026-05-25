@@ -233,6 +233,12 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
+                    return
+                # grace 동안 또는 miss 초반: 직진 경로 발행 (콘에 다가가기)
+                sample_xs = np.linspace(CONE_SAMPLE_X_START, CONE_SAMPLE_X_END, CONE_SAMPLE_N)
+                center_ys = np.zeros(CONE_SAMPLE_N)
+                self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
+                self._publish_target(stamp, TARGET_X, 0.0)
                 return
         else:
             if self._cone_prev_fit is None:
