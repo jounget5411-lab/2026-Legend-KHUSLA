@@ -75,6 +75,7 @@ CHILD_END_CLS_ID = 1
 PED_X_MAX = 8.0             # 전방 이 거리 이내
 PED_ROAD_HALF_WIDTH = 2.0   # center_path 기준 ± 이 폭 안에 있으면 "도로 안"
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
+PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
 
 # ======================== 헬퍼 ========================
 
@@ -118,6 +119,7 @@ class PathPlannerNode(Node):
 
         # PEDESTRIAN
         self._ped_timer = 0
+        self._ped_cooldown = 0
 
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
@@ -297,6 +299,9 @@ class PathPlannerNode(Node):
 
     def _check_pedestrian(self):
         """LANE 주행 중 도로 안에 사람(작은 장애물) 있으면 정지."""
+        if self._ped_cooldown > 0:
+            self._ped_cooldown -= 1
+            return
         if self._lane_center_coef is None:
             return
 
@@ -336,7 +341,8 @@ class PathPlannerNode(Node):
                 if abs(oy - center_y) < PED_ROAD_HALF_WIDTH:
                     return  # 아직 있음 → 계속 정지
 
-        self.get_logger().info("Pedestrian cleared → LANE")
+        self.get_logger().info("Pedestrian cleared → LANE (cooldown 20s)")
+        self._ped_cooldown = PED_COOLDOWN_TICKS
         self.phase = "LANE"
 
     # ---- LANE (친구 plan() 그대로) ----
