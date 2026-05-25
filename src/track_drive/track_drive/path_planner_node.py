@@ -318,7 +318,12 @@ class PathPlannerNode(Node):
 
     def _tick_pedestrian(self, stamp):
         """정지. 최소 3초 정지 후, 도로 안 작은 장애물 없으면 출발."""
-        # center_path 발행 안 함 → motion 정지
+        # 정지 경로 발행 — 차 바로 앞 짧은 경로 (motion이 즉시 감속)
+        stop_xs = np.array([0.3, 0.5], dtype=np.float64)
+        stop_ys = np.array([0.0, 0.0], dtype=np.float64)
+        self._pub_center.publish(_poses_from_xy(stamp, stop_xs, stop_ys))
+        self._publish_target(stamp, 0.3, 0.0)
+
         self._ped_timer -= 1
 
         if self._ped_timer > 0:
