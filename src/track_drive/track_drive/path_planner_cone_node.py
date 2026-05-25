@@ -42,6 +42,9 @@ FIT_SLOPE_MAX = 3.0        # |b| 제한
 # 왼쪽 줄 판별: 이전 왼쪽 피팅에서 이 거리 이내면 왼쪽 콘으로 인정
 LEFT_ACCEPT_DIST = 1.5     # (m) — 트랙폭 4.4m의 ~1/3, 오른쪽 콘은 2.2m+ 떨어져 걸러짐
 
+# 왼쪽 콘끼리 x 간격이 이 이상이면 먼 콘 버림 (끊긴 줄 잇지 않음)
+LEFT_MAX_X_GAP = 4.0       # (m)
+
 # 스무딩
 FIT_SMOOTH_ALPHA = 0.20    # 새 피팅 반영 비율
 FIT_MAX_MISS = 8           # 피팅 실패 시 이전 유지 최대 프레임
@@ -144,6 +147,16 @@ class PathPlannerConeNode(Node):
                 left_mask = all_y > 0
 
             lx, ly = all_x[left_mask], all_y[left_mask]
+
+            # x 정렬 후, 인접 콘 간 gap > 4m 이면 먼 콘 버림
+            if lx.size >= 2:
+                order = np.argsort(lx)
+                lx, ly = lx[order], ly[order]
+                gaps = np.diff(lx)
+                cut = np.where(gaps > LEFT_MAX_X_GAP)[0]
+                if cut.size > 0:
+                    keep = cut[0] + 1  # 첫 번째 큰 gap 앞까지만
+                    lx, ly = lx[:keep], ly[:keep]
 
             if (lx.size >= FIT_MIN_POINTS
                     and float(np.max(lx) - np.min(lx)) >= FIT_MIN_X_SPAN):
