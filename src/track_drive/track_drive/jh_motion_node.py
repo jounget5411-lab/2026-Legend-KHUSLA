@@ -31,8 +31,8 @@ STEERING_CURVE_GAIN = 1.20
 STEER_FOCUS_X = 3.0      # 가중 peak 위치 (m)
 STEER_FOCUS_SIGMA = 2.0  # 가중 폭 (m, σ) — 곡선 진입을 미리 보도록 약간 넓게
 
-ANGLE_MIN = -80.0
-ANGLE_MAX = 80.0
+ANGLE_MIN = -100.0
+ANGLE_MAX = 100.0
 # 응답 빠르게 하려고 α↑ (한 프레임에 변화의 75% 반영).
 ANGLE_SMOOTH_ALPHA = 0.75
 ANGLE_MAX_STEP = 16.0
@@ -49,8 +49,8 @@ SPEED_SLOW_FULL_DEG = 40.0
 TARGET_TIMEOUT_S = 0.5
 TARGET_Y_LIMIT = 4.0
 TARGET_X = 3.0
-LOOKAHEAD_X_MIN = 2.0
-LOOKAHEAD_X_MAX = 6.0
+LOOKAHEAD_X_MIN = 3.0
+LOOKAHEAD_X_MAX = 8.0
 
 
 # ======================== ROS 노드 ========================
