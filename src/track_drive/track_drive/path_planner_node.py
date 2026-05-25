@@ -32,7 +32,7 @@ CONE_Y_MAX = 6.0
 TRACK_WIDTH = 4.4
 TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
 
-CONE_FIT_MIN_POINTS = 1
+CONE_FIT_MIN_POINTS = 2
 CONE_FIT_MIN_X_SPAN = 0.8
 CONE_FIT_CURVE_MAX = 1.5
 CONE_FIT_SLOPE_MAX = 3.0
@@ -201,23 +201,19 @@ class PathPlannerNode(Node):
 
             lx, ly = all_x[left_mask], all_y[left_mask]
             if lx.size >= CONE_FIT_MIN_POINTS:
-                if lx.size == 1:
-                    # 1점: 수평선
-                    left_fit = np.array([0.0, 0.0, float(ly[0])])
-                else:
-                    x_span = float(np.max(lx) - np.min(lx))
-                    if x_span >= CONE_FIT_MIN_X_SPAN:
-                        try:
-                            deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
-                            w = 1.0 / (1.0 + lx * lx)
-                            coef = np.polyfit(lx, ly, deg, w=w)
-                            if deg == 1:
-                                coef = np.array([0.0, coef[0], coef[1]])
-                            a, b, _ = coef
-                            if abs(a) <= CONE_FIT_CURVE_MAX and abs(b) <= CONE_FIT_SLOPE_MAX:
-                                left_fit = coef
-                        except (np.linalg.LinAlgError, ValueError):
-                            pass
+                x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
+                if x_span >= CONE_FIT_MIN_X_SPAN:
+                    try:
+                        deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
+                        w = 1.0 / (1.0 + lx * lx)
+                        coef = np.polyfit(lx, ly, deg, w=w)
+                        if deg == 1:
+                            coef = np.array([0.0, coef[0], coef[1]])
+                        a, b, _ = coef
+                        if abs(a) <= CONE_FIT_CURVE_MAX and abs(b) <= CONE_FIT_SLOPE_MAX:
+                            left_fit = coef
+                    except (np.linalg.LinAlgError, ValueError):
+                        pass
 
         # grace period 카운트다운
         if self._cone_grace > 0:
