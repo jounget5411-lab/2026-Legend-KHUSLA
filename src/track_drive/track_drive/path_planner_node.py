@@ -59,7 +59,7 @@ CONE_SAMPLE_X_END = 6.0
 CONE_SAMPLE_N = 25
 
 CONE_TO_LANE_MISS = 30
-CONE_GRACE_TICKS = 30
+CONE_GRACE_TICKS = 20          # 2초 (20Hz)
 
 # ======================== YOLO 이벤트 cls_id ========================
 
@@ -116,6 +116,10 @@ class PathPlannerNode(Node):
         self._cone_prev_fit = None
         self._cone_miss = 0
         self._cone_grace = 0
+
+        # PEDESTRIAN: 감지된 사람 위치 추적
+        self._ped_x = None
+        self._ped_y = None
 
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
@@ -259,6 +263,12 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
+                    return
+                if self._cone_grace > 0:
+                    # grace 동안 피팅 실패 → 살짝 직진 (콘에 다가가기)
+                    sample_xs = np.linspace(CONE_SAMPLE_X_START, CONE_SAMPLE_X_END, CONE_SAMPLE_N)
+                    self._pub_center.publish(_poses_from_xy(stamp, sample_xs, np.zeros(CONE_SAMPLE_N)))
+                    self._publish_target(stamp, TARGET_X, 0.0)
                 return
         else:
             if self._cone_prev_fit is None:
@@ -304,33 +314,44 @@ class PathPlannerNode(Node):
             if _r < 0.4:
                 self.get_logger().info(
                     f"PEDESTRIAN detected at ({ox:.1f},{oy:.1f}) r={_r:.2f} → STOP")
+                self._ped_x = ox
+                self._ped_y = oy
                 self.phase = "PEDESTRIAN"
                 return
 
     def _tick_pedestrian(self, stamp):
-        """정지 상태. 사람이 중앙선 왼쪽(y > center_y)으로 넘어가면 출발."""
+        """정지 상태. 저장된 사람 위치 근처 장애물이 중앙선 왼쪽으로 넘어가면 출발."""
         # center_path 발행 안 함 → motion 정지
-        if self._lane_center_coef is None:
+        if self._lane_center_coef is None or self._ped_x is None:
             self.phase = "LANE"
             return
 
+        # 저장된 사람 위치 근처(3m 이내) 작은 장애물 찾기
+        best = None
+        best_dist = 999.0
         for ox, oy, _r in self._obstacles:
-            if ox > PED_X_MAX or ox < 0.3:
-                continue
             if _r >= 0.4:
                 continue
-            center_y = float(np.polyval(self._lane_center_coef, ox))
-            if oy > center_y:
-                # 중앙선 왼쪽으로 넘어감 → 출발
-                self.get_logger().info("Pedestrian crossed center → LANE")
-                self.phase = "LANE"
-                return
-            # 아직 중앙선 오른쪽 → 계속 정지
+            dist = abs(ox - self._ped_x) + abs(oy - self._ped_y)
+            if dist < best_dist:
+                best_dist = dist
+                best = (ox, oy)
+
+        if best is None or best_dist > 3.0:
+            # 사람 사라짐 → 출발
+            self.get_logger().info("Pedestrian gone → LANE")
+            self.phase = "LANE"
             return
 
-        # 장애물 사라짐 → 출발
-        self.get_logger().info("Pedestrian gone → LANE")
-        self.phase = "LANE"
+        # 사람 위치 갱신 (추적)
+        self._ped_x, self._ped_y = best
+
+        center_y = float(np.polyval(self._lane_center_coef, best[0]))
+        if best[1] > center_y:
+            # 중앙선 왼쪽으로 넘어감 → 출발
+            self.get_logger().info(
+                f"Pedestrian crossed center at ({best[0]:.1f},{best[1]:.1f}) → LANE")
+            self.phase = "LANE"
 
     # ---- LANE (친구 plan() 그대로) ----
 
