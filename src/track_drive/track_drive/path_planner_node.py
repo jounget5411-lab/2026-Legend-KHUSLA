@@ -73,13 +73,11 @@ CHILD_END_CLS_ID = 1
 # ======================== 사람 감지 (PEDESTRIAN) ========================
 
 PED_X_MAX = 8.0             # 전방 이 거리 이내
-PED_ROAD_HALF_WIDTH = 2.0   # center_path 기준 ± 이 폭
+PED_ROAD_HALF_WIDTH = 1.5   # center_path 기준 ± 이 폭 (좁게 — 나무 제외)
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
 PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
 PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
 PED_CAR_SPREAD = 1.5        # 클러스터 간 거리 이 이내면 밀집 (차)
-PED_SLOW_TICKS = 100        # 재출발 후 5초간 감속 (20Hz)
-PED_SLOW_SPEED = 5.0        # 감속 시 속도
 
 # ======================== 헬퍼 ========================
 
@@ -124,7 +122,6 @@ class PathPlannerNode(Node):
         # PEDESTRIAN
         self._ped_timer = 0
         self._ped_cooldown = 0
-        self._ped_slow_timer = 0
 
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
@@ -197,8 +194,6 @@ class PathPlannerNode(Node):
             self._tick_cone(stamp)
         elif self.phase == "LANE":
             self._check_pedestrian()
-            if self._ped_slow_timer > 0:
-                self._ped_slow_timer -= 1
             self._tick_lane(stamp)
         elif self.phase == "PEDESTRIAN":
             self._tick_pedestrian(stamp)
@@ -363,9 +358,8 @@ class PathPlannerNode(Node):
                 if abs(oy - center_y) < PED_ROAD_HALF_WIDTH:
                     return  # 아직 있음 → 계속 정지
 
-        self.get_logger().info("Pedestrian cleared → LANE (cooldown 20s, slow 5s)")
+        self.get_logger().info("Pedestrian cleared → LANE (cooldown 20s)")
         self._ped_cooldown = PED_COOLDOWN_TICKS
-        self._ped_slow_timer = PED_SLOW_TICKS
         self.phase = "LANE"
 
     # ---- LANE (친구 plan() 그대로) ----
@@ -389,17 +383,8 @@ class PathPlannerNode(Node):
         target_x, target_y = result["target"]
         sample_xs = result["sample_xs"]
 
-        # 감속 중이면 가까운 점만 발행 → motion이 자동 감속
-        pub_xs = sample_xs
-        pub_ys = result["sample_ys"]
-        if self._ped_slow_timer > 0:
-            near = pub_xs <= 3.0
-            if np.any(near):
-                pub_xs = pub_xs[near]
-                pub_ys = pub_ys[near]
-
         self._publish_target(stamp, target_x, target_y)
-        self._pub_center.publish(_make_pose_array(stamp, pub_xs, pub_ys))
+        self._pub_center.publish(_make_pose_array(stamp, sample_xs, result["sample_ys"]))
         self._pub_left.publish(_make_pose_array(stamp, sample_xs, result["left_ys"]))
         self._pub_right.publish(_make_pose_array(stamp, sample_xs, result["right_ys"]))
 
