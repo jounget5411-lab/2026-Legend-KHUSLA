@@ -89,7 +89,6 @@ class PathPlannerNode(Node):
         super().__init__("path_planner_node")
 
         self.phase = "WAIT"
-        self._auto = False
 
         # 데이터
         self._obstacles = []
@@ -110,7 +109,6 @@ class PathPlannerNode(Node):
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
         self.create_subscription(PoseArray, "/fused/lane", self._on_lane, 10)
         self.create_subscription(PoseArray, "/detect/events_raw", self._on_events, 10)
-        self.create_subscription(Bool, "/auto_mode", self._on_auto, 10)
 
         # 발행
         self._pub_center = self.create_publisher(PoseArray, "/center_path", 10)
@@ -139,17 +137,9 @@ class PathPlannerNode(Node):
     def _on_events(self, msg: PoseArray):
         self._events = [int(p.position.z) for p in msg.poses]
 
-    def _on_auto(self, msg: Bool):
-        if self._auto != msg.data:
-            self._auto = msg.data
-            self.get_logger().info(f"auto_mode = {'ON' if self._auto else 'OFF'}")
-
     # ---- 메인 틱 ----
 
     def _tick(self):
-        if not self._auto:
-            return
-
         stamp = self.get_clock().now().to_msg()
 
         if self.phase == "WAIT":
