@@ -177,14 +177,14 @@ class PathPlannerNode(Node):
         elif self.phase == "CONE":
             self._tick_cone(stamp)
         elif self.phase == "LANE":
-            self._check_lane_events()
+            # self._check_lane_events()  # 예외 처리 활성화 시 주석 해제
             self._tick_lane(stamp)
-        elif self.phase == "STOP_SIGNAL":
-            self._tick_stop_signal(stamp)
-        elif self.phase == "TURN_LEFT":
-            self._tick_turn_left(stamp)
-        elif self.phase == "SCHOOL_ZONE":
-            self._tick_school_zone(stamp)
+        # elif self.phase == "EXCEPTION_1":
+        #     self._tick_exception_1(stamp)
+        # elif self.phase == "EXCEPTION_2":
+        #     self._tick_exception_2(stamp)
+        # elif self.phase == "EXCEPTION_3":
+        #     self._tick_exception_3(stamp)
 
         # 로그
         self._log_counter += 1
@@ -279,50 +279,41 @@ class PathPlannerNode(Node):
                                  -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
         self._publish_target(stamp, TARGET_X, target_y)
 
-    # ---- LANE 이벤트 체크 (YOLO) ----
-
-    def _check_lane_events(self):
-        """LANE 주행 중 YOLO 이벤트로 예외 상태 전환."""
-        events = self._events
-
-        if RED_CLS_ID in events or YELLOW_LIGHT_CLS_ID in events:
-            self.get_logger().info("RED/YELLOW light → STOP_SIGNAL")
-            self.phase = "STOP_SIGNAL"
-            return
-
-        # TODO: 아래 전환 조건은 나중에 구현
-        # if LEFT_SIGN_CLS_ID in events:
-        #     self.get_logger().info("LEFT sign → TURN_LEFT")
-        #     self.phase = "TURN_LEFT"
-        #     return
-        #
-        # if CHILD_START_CLS_ID in events:
-        #     self.get_logger().info("CHILD_START → SCHOOL_ZONE")
-        #     self.phase = "SCHOOL_ZONE"
-        #     return
-
-    # ---- STOP_SIGNAL: 빨간불 정지, 초록불 복귀 ----
-
-    def _tick_stop_signal(self, stamp):
-        # 정지 — center_path 발행 안 함 → motion 정지
-        if GREEN_CLS_ID in self._events:
-            self.get_logger().info("GREEN detected → LANE")
-            self.phase = "LANE"
-
-    # ---- TURN_LEFT: 좌회전 (TODO) ----
-
-    def _tick_turn_left(self, stamp):
-        # TODO: 좌회전 로직 구현. 지금은 차선 주행 유지.
-        self._tick_lane(stamp)
-
-    # ---- SCHOOL_ZONE: 어린이구역 (TODO) ----
-
-    def _tick_school_zone(self, stamp):
-        # TODO: 감속 등. 지금은 차선 주행 유지.
-        self._tick_lane(stamp)
-        if CHILD_END_CLS_ID in self._events:
-            self.get_logger().info("CHILD_END → LANE")
-            self.phase = "LANE"
+    # ================================================================
+    # 예외 상태 껍데기 — 주석 해제 + 로직 채워서 사용
+    # 전환: _check_lane_events()에서 self.phase = "EXCEPTION_1" 등
+    # 복귀: 각 _tick_exception_N()에서 self.phase = "LANE"
+    # ================================================================
+    #
+    # def _check_lane_events(self):
+    #     """LANE 주행 중 예외 상태 전환. 센서/YOLO/라이다 등 조건 자유."""
+    #     # 예외 1: 예) 빨간불 → 정지
+    #     # if RED_CLS_ID in self._events:
+    #     #     self.phase = "EXCEPTION_1"
+    #     #
+    #     # 예외 2: 예) 좌회전 표지
+    #     # if LEFT_SIGN_CLS_ID in self._events:
+    #     #     self.phase = "EXCEPTION_2"
+    #     #
+    #     # 예외 3: 예) 어린이구역
+    #     # if CHILD_START_CLS_ID in self._events:
+    #     #     self.phase = "EXCEPTION_3"
+    #     pass
+    #
+    # def _tick_exception_1(self, stamp):
+    #     """예외 1 처리. 끝나면 self.phase = "LANE"."""
+    #     # 예) 정지 후 초록불 대기
+    #     # if GREEN_CLS_ID in self._events:
+    #     #     self.phase = "LANE"
+    #     pass
+    #
+    # def _tick_exception_2(self, stamp):
+    #     """예외 2 처리. 끝나면 self.phase = "LANE"."""
+    #     self._tick_lane(stamp)  # 기본: 차선 주행 유지
+    #
+    # def _tick_exception_3(self, stamp):
+    #     """예외 3 처리. 끝나면 self.phase = "LANE"."""
+    #     self._tick_lane(stamp)  # 기본: 차선 주행 유지
 
     # ---- LANE (친구 plan() 그대로) ----
 
