@@ -143,8 +143,6 @@ class PathPlannerNode(Node):
         self._pub_left = self.create_publisher(PoseArray, "/lane_left", 10)
         self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
         self._pub_fits = self.create_publisher(PoseArray, "/lane_fits", 10)
-        from xycar_msgs.msg import XycarMotor
-        self._pub_motor = self.create_publisher(XycarMotor, "/xycar_motor", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self._log_counter = 0
@@ -320,13 +318,7 @@ class PathPlannerNode(Node):
 
     def _tick_pedestrian(self, stamp):
         """정지. 최소 3초 정지 후, 도로 안 작은 장애물 없으면 출발."""
-        # 모터 직접 정지 명령
-        from xycar_msgs.msg import XycarMotor
-        stop = XycarMotor()
-        stop.header.stamp = stamp
-        stop.speed = 0.0
-        stop.angle = 0.0
-        self._pub_motor.publish(stop)
+        # center_path 발행 안 함 → motion이 0.15초 뒤 자동 정지
 
         self._ped_timer -= 1
 
