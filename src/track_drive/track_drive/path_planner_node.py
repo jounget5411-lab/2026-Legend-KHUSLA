@@ -17,6 +17,8 @@ from rclpy.node import Node
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 
+from .common import LaneMemory, plan_drive_target
+
 # ======================== 공통 상수 ========================
 
 PLAN_HZ = 10
@@ -49,21 +51,6 @@ CONE_TO_LANE_MISS = 30          # 3초 연속 못 찾으면 전환
 CONE_GRACE_TICKS = 30           # CONE 진입 후 3초간 miss 카운트 안 함
 LANE_MIN_POINTS_FOR_SWITCH = 10
 
-# ======================== LANE 상수 (sm plan 간소화) ========================
-
-LANE_FIT_X_MIN = 0.5
-LANE_FIT_X_MAX = 12.0
-LANE_FIT_MIN_POINTS = 12
-LANE_FIT_MIN_X_SPAN = 0.75
-LANE_FIT_CURVE_MAX = 1.30
-LANE_FIT_SLOPE_MAX = 2.80
-LANE_HALF_WIDTH = 1.50
-LANE_SMOOTH_ALPHA = 0.28
-LANE_MAX_MISS = 6
-LANE_SAMPLE_X_MIN = 1.0
-LANE_SAMPLE_X_MAX = 11.0
-LANE_SAMPLE_COUNT = 13
-LANE_TARGET_SMOOTH_ALPHA = 0.22
 
 # ======================== WAIT 상수 ========================
 
@@ -103,9 +90,7 @@ class PathPlannerNode(Node):
         self._cone_grace = 0
 
         # LANE 상태
-        self._lane_prev_fit = None
-        self._lane_miss = 0
-        self._lane_prev_target_y = 0.0
+        self._lane_memory = LaneMemory()
 
         # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
@@ -233,12 +218,6 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
-                    return
-                # grace 동안 또는 miss 초반: 직진 경로 발행 (콘에 다가가기)
-                sample_xs = np.linspace(CONE_SAMPLE_X_START, CONE_SAMPLE_X_END, CONE_SAMPLE_N)
-                center_ys = np.zeros(CONE_SAMPLE_N)
-                self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
-                self._publish_target(stamp, TARGET_X, 0.0)
                 return
         else:
             if self._cone_prev_fit is None:
@@ -269,63 +248,16 @@ class PathPlannerNode(Node):
     # ---- LANE ----
 
     def _tick_lane(self, stamp):
-        xs = self._lane_xs
-        ys = self._lane_ys
+        result = plan_drive_target(self._lane_xs, self._lane_ys, self._lane_memory)
 
-        # ROI
-        if xs.size > 0:
-            roi = ((xs > LANE_FIT_X_MIN) & (xs < LANE_FIT_X_MAX)
-                   & (np.abs(ys) < TARGET_Y_LIMIT))
-            xs, ys = xs[roi], ys[roi]
+        if not result.ok:
+            return
 
-        lane_fit = None
-        if (xs.size >= LANE_FIT_MIN_POINTS
-                and float(np.max(xs) - np.min(xs)) >= LANE_FIT_MIN_X_SPAN):
-            try:
-                w = 1.0 / (1.0 + xs * xs)
-                coef = np.polyfit(xs, ys, 2, w=w)
-                a, b, _ = coef
-                if abs(a) <= LANE_FIT_CURVE_MAX and abs(b) <= LANE_FIT_SLOPE_MAX:
-                    lane_fit = coef
-            except (np.linalg.LinAlgError, ValueError):
-                pass
+        self._publish_target(stamp, result.target_x, result.target_y)
 
-        # EMA + miss
-        if lane_fit is None:
-            self._lane_miss += 1
-            if self._lane_prev_fit is not None and self._lane_miss <= LANE_MAX_MISS:
-                lane_fit = self._lane_prev_fit
-            else:
-                self._lane_prev_fit = None
-                return
-        else:
-            if self._lane_prev_fit is None:
-                self._lane_prev_fit = np.asarray(lane_fit, dtype=np.float64)
-            else:
-                self._lane_prev_fit = (
-                    (1.0 - LANE_SMOOTH_ALPHA) * self._lane_prev_fit
-                    + LANE_SMOOTH_ALPHA * np.asarray(lane_fit, dtype=np.float64))
-            lane_fit = self._lane_prev_fit
-            self._lane_miss = 0
-
-        sample_xs = np.linspace(LANE_SAMPLE_X_MIN, LANE_SAMPLE_X_MAX, LANE_SAMPLE_COUNT)
-        center_ys = np.clip(np.polyval(lane_fit, sample_xs), -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
-
-        left_coef = lane_fit.copy(); left_coef[2] += LANE_HALF_WIDTH
-        right_coef = lane_fit.copy(); right_coef[2] -= LANE_HALF_WIDTH
-
-        self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
-        self._pub_left.publish(_poses_from_xy(stamp, sample_xs,
-                               np.polyval(left_coef, sample_xs)))
-        self._pub_right.publish(_poses_from_xy(stamp, sample_xs,
-                                np.polyval(right_coef, sample_xs)))
-
-        raw_y = float(np.clip(np.polyval(lane_fit, TARGET_X),
-                              -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
-        delta = raw_y - self._lane_prev_target_y
-        target_y = self._lane_prev_target_y + LANE_TARGET_SMOOTH_ALPHA * delta
-        self._lane_prev_target_y = target_y
-        self._publish_target(stamp, TARGET_X, target_y)
+        if result.path_xs is not None and len(result.path_xs) >= 2:
+            self._pub_center.publish(
+                _poses_from_xy(stamp, result.path_xs, result.path_ys))
 
     # ---- 공통 ----
 
