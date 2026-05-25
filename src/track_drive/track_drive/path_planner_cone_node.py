@@ -26,7 +26,7 @@ PLAN_HZ = 10
 # 콘 ROI
 CONE_X_MIN = 0.3
 CONE_X_MAX = 7.0
-CONE_Y_MIN = -1.0          # 왼쪽 콘은 대체로 y>0 이지만 곡선 여유
+CONE_Y_MIN = -6.0          # 곡선에서 양쪽 콘 다 잡히게 넓게
 CONE_Y_MAX = 6.0
 
 # 트랙 폭
