@@ -43,7 +43,7 @@ FIT_SLOPE_MAX = 3.0        # |b| 제한
 LEFT_ACCEPT_DIST = 1.5     # (m) — 트랙폭 4.4m의 ~1/3, 오른쪽 콘은 2.2m+ 떨어져 걸러짐
 
 # 왼쪽 콘끼리 x 간격이 이 이상이면 먼 콘 버림 (끊긴 줄 잇지 않음)
-LEFT_MAX_X_GAP = 5.0       # (m) — 콘 간격 ~3m, 하나 놓치면 ~6m. 5m면 정상 커버.
+LEFT_MAX_X_GAP = 4.2       # (m) — 정상 콘 gap ~3~4m, 오인 콘 끊기
 
 # 스무딩
 FIT_SMOOTH_ALPHA = 0.20    # 새 피팅 반영 비율
@@ -193,13 +193,10 @@ class PathPlannerConeNode(Node):
 
         left_ys = np.polyval(left_fit, sample_xs)
         center_ys = np.polyval(center_coef, sample_xs)
-        right_ys = center_ys - TRACK_HALF_WIDTH
-
         center_ys = np.clip(center_ys, -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
 
-        # 발행
+        # 발행 (lane_left = 실제 왼쪽 콘 피팅, lane_right는 발행 안 함)
         self._pub_left.publish(_poses_from_xy(stamp, sample_xs, left_ys))
-        self._pub_right.publish(_poses_from_xy(stamp, sample_xs, right_ys))
         self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
 
         target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
