@@ -61,9 +61,14 @@ CONE_SAMPLE_N = 25
 CONE_TO_LANE_MISS = 30
 CONE_GRACE_TICKS = 30
 
-# ======================== WAIT 상수 ========================
+# ======================== YOLO 이벤트 cls_id ========================
 
 GREEN_CLS_ID = 5
+RED_CLS_ID = 9
+YELLOW_LIGHT_CLS_ID = 11
+LEFT_SIGN_CLS_ID = 7
+CHILD_START_CLS_ID = 3
+CHILD_END_CLS_ID = 1
 
 # ======================== 헬퍼 ========================
 
@@ -172,7 +177,14 @@ class PathPlannerNode(Node):
         elif self.phase == "CONE":
             self._tick_cone(stamp)
         elif self.phase == "LANE":
+            self._check_lane_events()
             self._tick_lane(stamp)
+        elif self.phase == "STOP_SIGNAL":
+            self._tick_stop_signal(stamp)
+        elif self.phase == "TURN_LEFT":
+            self._tick_turn_left(stamp)
+        elif self.phase == "SCHOOL_ZONE":
+            self._tick_school_zone(stamp)
 
         # 로그
         self._log_counter += 1
@@ -266,6 +278,51 @@ class PathPlannerNode(Node):
         target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
                                  -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
         self._publish_target(stamp, TARGET_X, target_y)
+
+    # ---- LANE 이벤트 체크 (YOLO) ----
+
+    def _check_lane_events(self):
+        """LANE 주행 중 YOLO 이벤트로 예외 상태 전환."""
+        events = self._events
+
+        if RED_CLS_ID in events or YELLOW_LIGHT_CLS_ID in events:
+            self.get_logger().info("RED/YELLOW light → STOP_SIGNAL")
+            self.phase = "STOP_SIGNAL"
+            return
+
+        # TODO: 아래 전환 조건은 나중에 구현
+        # if LEFT_SIGN_CLS_ID in events:
+        #     self.get_logger().info("LEFT sign → TURN_LEFT")
+        #     self.phase = "TURN_LEFT"
+        #     return
+        #
+        # if CHILD_START_CLS_ID in events:
+        #     self.get_logger().info("CHILD_START → SCHOOL_ZONE")
+        #     self.phase = "SCHOOL_ZONE"
+        #     return
+
+    # ---- STOP_SIGNAL: 빨간불 정지, 초록불 복귀 ----
+
+    def _tick_stop_signal(self, stamp):
+        # 정지 — center_path 발행 안 함 → motion 정지
+        if GREEN_CLS_ID in self._events:
+            self.get_logger().info("GREEN detected → LANE")
+            self.phase = "LANE"
+
+    # ---- TURN_LEFT: 좌회전 (TODO) ----
+
+    def _tick_turn_left(self, stamp):
+        # TODO: 좌회전 로직 구현. 지금은 차선 주행 유지.
+        self._tick_lane(stamp)
+
+    # ---- SCHOOL_ZONE: 어린이구역 (TODO) ----
+
+    def _tick_school_zone(self, stamp):
+        # TODO: 감속 등. 지금은 차선 주행 유지.
+        self._tick_lane(stamp)
+        if CHILD_END_CLS_ID in self._events:
+            self.get_logger().info("CHILD_END → LANE")
+            self.phase = "LANE"
 
     # ---- LANE (친구 plan() 그대로) ----
 
