@@ -34,7 +34,7 @@ TRACK_WIDTH = 4.4
 TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0   # 2.2m — 왼쪽 줄에서 중앙까지
 
 # 피팅
-FIT_MIN_POINTS = 3
+FIT_MIN_POINTS = 2
 FIT_MIN_X_SPAN = 0.8
 FIT_CURVE_MAX = 1.5        # |a| 제한 (2차 계수)
 FIT_SLOPE_MAX = 3.0        # |b| 제한
@@ -44,8 +44,11 @@ FIT_SLOPE_MAX = 3.0        # |b| 제한
 LEFT_FRACTION = 0.5
 
 # 스무딩
-FIT_SMOOTH_ALPHA = 0.30    # 새 피팅 반영 비율 (친구 YELLOW_FIT_SMOOTH_ALPHA와 동일)
+FIT_SMOOTH_ALPHA = 0.20    # 새 피팅 반영 비율 (낮을수록 안정, 촐랑댐 감소)
 FIT_MAX_MISS = 8           # 피팅 실패 시 이전 유지 최대 프레임
+
+# 좌우 분리 기준선 추적
+SPLIT_SMOOTH_ALPHA = 0.15  # 기준선 이동 속도 (낮을수록 느리게 → 커브 진입 시 점진 전환)
 
 # 중앙선 샘플
 SAMPLE_X_START = 0.5
@@ -84,6 +87,7 @@ class PathPlannerConeNode(Node):
         self._obstacles = []
         self._prev_left_fit = None     # 왼쪽 줄 EMA 피팅 계수
         self._miss_count = 0
+        self._y_split = 0.0            # 좌우 분리 기준 y (추적됨)
         self._width_collecting = 0
         self._width_samples = []
         self._log_counter = 0
@@ -126,6 +130,7 @@ class PathPlannerConeNode(Node):
         sample_xs = self._sample_xs
 
         # ROI 필터
+        raw_n = len(self._obstacles)
         all_x = np.array([o[0] for o in self._obstacles])
         all_y = np.array([o[1] for o in self._obstacles])
         if all_x.size > 0:
@@ -133,21 +138,47 @@ class PathPlannerConeNode(Node):
                    & (all_y >= CONE_Y_MIN) & (all_y <= CONE_Y_MAX))
             all_x, all_y = all_x[roi], all_y[roi]
 
-        # 왼쪽 줄 추출: y가 큰 쪽 절반
+        self._log_counter += 1
+        do_log = self._log_counter >= PLAN_HZ
+        if do_log:
+            self._log_counter = 0
+
+        if do_log:
+            self.get_logger().info(
+                f"[DBG] raw={raw_n} roi={all_x.size} "
+                f"ys=[{','.join(f'{y:.1f}' for y in all_y[:6])}]")
+
+        # 왼쪽 줄 추출: y_split 기준으로 위쪽 = 왼쪽
         left_fit = None
         if all_x.size >= FIT_MIN_POINTS:
-            y_median = float(np.median(all_y))
-            left_mask = all_y >= y_median
+            left_mask = all_y >= self._y_split
             lx, ly = all_x[left_mask], all_y[left_mask]
 
-            if (lx.size >= FIT_MIN_POINTS
-                    and float(np.max(lx) - np.min(lx)) >= FIT_MIN_X_SPAN):
+            if lx.size < FIT_MIN_POINTS:
+                left_mask = all_y >= np.median(all_y)
+                lx, ly = all_x[left_mask], all_y[left_mask]
+
+            x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
+
+            if do_log:
+                self.get_logger().info(
+                    f"[DBG] split_y={self._y_split:+.2f} left={lx.size} "
+                    f"x_span={x_span:.2f}")
+
+            if lx.size >= FIT_MIN_POINTS and x_span >= FIT_MIN_X_SPAN:
                 try:
                     w = 1.0 / (1.0 + lx * lx)
                     coef = np.polyfit(lx, ly, 2, w=w)
                     a, b, _ = coef
+                    if do_log:
+                        self.get_logger().info(
+                            f"[DBG] fit a={a:.4f} b={b:.4f}")
                     if abs(a) <= FIT_CURVE_MAX and abs(b) <= FIT_SLOPE_MAX:
                         left_fit = coef
+                        new_split = float(np.mean(ly)) - TRACK_HALF_WIDTH
+                        self._y_split = (
+                            (1.0 - SPLIT_SMOOTH_ALPHA) * self._y_split
+                            + SPLIT_SMOOTH_ALPHA * new_split)
                 except (np.linalg.LinAlgError, ValueError):
                     pass
 
