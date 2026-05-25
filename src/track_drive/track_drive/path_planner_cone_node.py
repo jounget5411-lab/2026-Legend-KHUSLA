@@ -137,31 +137,36 @@ class PathPlannerConeNode(Node):
         left_fit = None
         if all_x.size >= FIT_MIN_POINTS:
             if self._prev_left_fit is not None:
-                # 이전 왼쪽 줄에서 가까운 콘만 왼쪽으로 인정
                 expected_y = np.polyval(self._prev_left_fit, all_x)
                 left_mask = np.abs(all_y - expected_y) < LEFT_ACCEPT_DIST
             else:
-                # 첫 프레임: y>0 을 왼쪽으로 (직선 출발)
                 left_mask = all_y > 0
 
             lx, ly = all_x[left_mask], all_y[left_mask]
 
-            if (lx.size >= FIT_MIN_POINTS
-                    and float(np.max(lx) - np.min(lx)) >= FIT_MIN_X_SPAN):
-                try:
-                    w = 1.0 / (1.0 + lx * lx)
-                    coef = np.polyfit(lx, ly, 2, w=w)
-                    a, b, _ = coef
-                    if abs(a) <= FIT_CURVE_MAX and abs(b) <= FIT_SLOPE_MAX:
-                        left_fit = coef
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+            # 가까운 콘만(x < 5m) 있으면 직선, 멀리도 있으면 2차
+            if lx.size >= FIT_MIN_POINTS:
+                x_span = float(np.max(lx) - np.min(lx))
+                if x_span >= FIT_MIN_X_SPAN:
+                    try:
+                        deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
+                        w = 1.0 / (1.0 + lx * lx)
+                        coef = np.polyfit(lx, ly, deg, w=w)
+                        if deg == 1:
+                            coef = np.array([0.0, coef[0], coef[1]])
+                        a, b, _ = coef
+                        if abs(a) <= FIT_CURVE_MAX and abs(b) <= FIT_SLOPE_MAX:
+                            left_fit = coef
+                    except (np.linalg.LinAlgError, ValueError):
+                        pass
 
-        # EMA 스무딩 + miss 유지 (친구 _fit_yellow_sliding 구조)
+        # miss → 이전 피팅 유지 (2차→직선화: a=0으로)
         if left_fit is None:
             self._miss_count += 1
             if self._prev_left_fit is not None and self._miss_count <= FIT_MAX_MISS:
-                left_fit = self._prev_left_fit
+                prev = self._prev_left_fit.copy()
+                prev[0] *= max(0.0, 1.0 - self._miss_count * 0.2)
+                left_fit = prev
             else:
                 self._prev_left_fit = None
                 return
