@@ -32,7 +32,7 @@ CONE_Y_MAX = 6.0
 TRACK_WIDTH = 4.4
 TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
 
-CONE_FIT_MIN_POINTS = 2
+CONE_FIT_MIN_POINTS = 1
 CONE_FIT_MIN_X_SPAN = 0.8
 CONE_FIT_CURVE_MAX = 1.5
 CONE_FIT_SLOPE_MAX = 3.0
@@ -179,6 +179,17 @@ class PathPlannerNode(Node):
                    & (all_y >= CONE_Y_MIN) & (all_y <= CONE_Y_MAX))
             all_x, all_y = all_x[roi], all_y[roi]
 
+        # 디버그 (1초마다)
+        self._log_counter += 1
+        do_log = self._log_counter >= PLAN_HZ
+        if do_log:
+            self._log_counter = 0
+            lcount = int(np.sum(all_y > 0)) if all_x.size > 0 else 0
+            self.get_logger().info(
+                f"[CONE] obs={all_x.size} left(y>0)={lcount} "
+                f"miss={self._cone_miss} grace={self._cone_grace} "
+                f"prev_fit={'Y' if self._cone_prev_fit is not None else 'N'}")
+
         # 왼쪽 줄 추출
         left_fit = None
         if all_x.size >= CONE_FIT_MIN_POINTS:
@@ -190,19 +201,23 @@ class PathPlannerNode(Node):
 
             lx, ly = all_x[left_mask], all_y[left_mask]
             if lx.size >= CONE_FIT_MIN_POINTS:
-                x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
-                if x_span >= CONE_FIT_MIN_X_SPAN:
-                    try:
-                        deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
-                        w = 1.0 / (1.0 + lx * lx)
-                        coef = np.polyfit(lx, ly, deg, w=w)
-                        if deg == 1:
-                            coef = np.array([0.0, coef[0], coef[1]])
-                        a, b, _ = coef
-                        if abs(a) <= CONE_FIT_CURVE_MAX and abs(b) <= CONE_FIT_SLOPE_MAX:
-                            left_fit = coef
-                    except (np.linalg.LinAlgError, ValueError):
-                        pass
+                if lx.size == 1:
+                    # 1점: 수평선
+                    left_fit = np.array([0.0, 0.0, float(ly[0])])
+                else:
+                    x_span = float(np.max(lx) - np.min(lx))
+                    if x_span >= CONE_FIT_MIN_X_SPAN:
+                        try:
+                            deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
+                            w = 1.0 / (1.0 + lx * lx)
+                            coef = np.polyfit(lx, ly, deg, w=w)
+                            if deg == 1:
+                                coef = np.array([0.0, coef[0], coef[1]])
+                            a, b, _ = coef
+                            if abs(a) <= CONE_FIT_CURVE_MAX and abs(b) <= CONE_FIT_SLOPE_MAX:
+                                left_fit = coef
+                        except (np.linalg.LinAlgError, ValueError):
+                            pass
 
         # grace period 카운트다운
         if self._cone_grace > 0:
