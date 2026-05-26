@@ -29,11 +29,11 @@ from .common import LIDAR_FRAME
 # ======================== 라이다 파라미터 ========================
 
 LIDAR_RANGE_MIN = 0.1   # 최소 유효 거리 (m) — 차체 반사 제거
-LIDAR_RANGE_MAX = 10.0  # 최대 유효 거리 (m)
+LIDAR_RANGE_MAX = 8.0   # 최대 유효 거리 (m)
 
 # 장애물 ROI (lidar_frame 미터) — 트랙 밖 노이즈 차단용, 튜닝 가능
 OBS_X_MIN = 0.3         # 전방 최소 (m)
-OBS_X_MAX = 10.0        # 전방 최대 (m)
+OBS_X_MAX = 8.0         # 전방 최대 (m)
 OBS_Y_HALF = 6.0        # 좌우 ± (m) — 라바콘 진입 구간까지 포함
 
 # 클러스터링 — 튜닝 가능

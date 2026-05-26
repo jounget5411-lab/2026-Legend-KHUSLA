@@ -265,8 +265,7 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
-                    self._ped_cooldown = 100  # CONE→LANE 직후 5초간 보행자 감지 안 함
-                    self._tick_lane(stamp)
+                    self._tick_lane(stamp)  # 즉시 차선 경로 발행 (경로 끊김 방지)
                     return
                 if self._cone_grace > 0:
                     # grace 동안 피팅 실패 → 살짝 직진 (콘에 다가가기)
