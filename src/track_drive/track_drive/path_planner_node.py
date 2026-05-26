@@ -72,8 +72,8 @@ CHILD_END_CLS_ID = 1
 
 # ======================== 사람 감지 (PEDESTRIAN) ========================
 
-PED_X_MAX = 8.0             # 전방 이 거리 이내
-PED_ROAD_HALF_WIDTH = 1.5   # center_path 기준 ± 이 폭 (좁게 — 나무 제외)
+PED_X_MAX = 10.0            # 전방 이 거리 이내
+PED_ROAD_HALF_WIDTH = 1.8   # center_path 기준 ± 이 폭
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
 PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
 PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
@@ -265,6 +265,7 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
+                    self._tick_lane(stamp)  # 즉시 차선 경로 발행 (경로 끊김 방지)
                     return
                 if self._cone_grace > 0:
                     # grace 동안 피팅 실패 → 살짝 직진 (콘에 다가가기)
