@@ -313,8 +313,8 @@ class PathPlannerNode(Node):
         for ox, oy, _r in self._obstacles:
             if ox > PED_X_MAX or ox < 0.3:
                 continue
-            if _r >= 0.4:
-                continue  # 큰 클러스터 = 차/꼬깔/나무 → 무시
+            if _r < 0.1 or _r >= 0.4:
+                continue  # 너무 작으면(점1개=노이즈/꼬깔) 무시, 너무 크면(차/나무) 무시
             center_y = float(np.polyval(self._lane_center_coef, ox))
             dist = abs(oy - center_y)
             if dist <= PED_ROAD_HALF_WIDTH:
