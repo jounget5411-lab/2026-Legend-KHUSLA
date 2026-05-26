@@ -18,6 +18,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PointStamped, PoseArray
+from std_msgs.msg import Bool
 from xycar_msgs.msg import XycarMotor
 
 # ======================== 제어 파라미터 ========================
@@ -116,9 +117,11 @@ class MotionNode(Node):
         self._prev_steer_ratio = 0.0
         self._exit_unwind_frames = 0
         self._straight_boost_level = 0.0
+        self._e_stop = False
 
         self.create_subscription(PoseArray, "/center_path", self._on_path, 10)
         self.create_subscription(PointStamped, "/target", self._on_target, 10)
+        self.create_subscription(Bool, "/emergency_stop", self._on_estop, 10)
         self._pub = self.create_publisher(XycarMotor, "/xycar_motor", 10)
         self.create_timer(1.0 / CONTROL_HZ, self._tick)
 
@@ -142,7 +145,14 @@ class MotionNode(Node):
     def _on_target(self, msg: PointStamped):
         self._target_stamp = self.get_clock().now()
 
+    def _on_estop(self, msg: Bool):
+        self._e_stop = msg.data
+
     def _tick(self):
+        if self._e_stop:
+            self._publish_motor(SPEED_STOP, 0.0)
+            return
+
         now = self.get_clock().now()
 
         if self._path_stamp is None and self._target_stamp is None:

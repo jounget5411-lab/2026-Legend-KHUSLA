@@ -147,6 +147,8 @@ class PathPlannerNode(Node):
         self._pub_left = self.create_publisher(PoseArray, "/lane_left", 10)
         self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
         self._pub_fits = self.create_publisher(PoseArray, "/lane_fits", 10)
+        from std_msgs.msg import Bool
+        self._pub_estop = self.create_publisher(Bool, "/emergency_stop", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self._log_counter = 0
@@ -344,13 +346,16 @@ class PathPlannerNode(Node):
             f"road_obs={len(road_obs)} dense={dense_count} → STOP")
         self._ped_timer = PED_MIN_STOP_TICKS
         self.phase = "PEDESTRIAN"
+        from std_msgs.msg import Bool
+        self._pub_estop.publish(Bool(data=True))
 
     def _tick_pedestrian(self, stamp):
-        """정지. _tick_lane 호출해서 피팅 유지, target만 가까이 보내서 감속."""
+        """정지. _tick_lane 호출해서 피팅 유지, estop으로 motion 정지."""
+        from std_msgs.msg import Bool
         # 차선 피팅/발행 유지 (재출발 시 끊김 방지)
         self._tick_lane(stamp)
-        # target을 아주 가까이 덮어써서 motion 감속
-        self._publish_target(stamp, 0.3, 0.0)
+        # motion 정지
+        self._pub_estop.publish(Bool(data=True))
 
         self._ped_timer -= 1
 
@@ -369,6 +374,7 @@ class PathPlannerNode(Node):
                     return  # 아직 있음 → 계속 정지
 
         self.get_logger().info("Pedestrian cleared → LANE (cooldown 20s)")
+        self._pub_estop.publish(Bool(data=False))
         self._ped_cooldown = PED_COOLDOWN_TICKS
         self.phase = "LANE"
 
