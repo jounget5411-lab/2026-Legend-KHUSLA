@@ -346,8 +346,11 @@ class PathPlannerNode(Node):
         self.phase = "PEDESTRIAN"
 
     def _tick_pedestrian(self, stamp):
-        """정지. 최소 3초 정지 후, 도로 안 작은 장애물 없으면 출발."""
-        # center_path 발행 안 함 → motion이 0.15초 뒤 자동 정지
+        """정지. _tick_lane 호출해서 피팅 유지, target만 가까이 보내서 감속."""
+        # 차선 피팅/발행 유지 (재출발 시 끊김 방지)
+        self._tick_lane(stamp)
+        # target을 아주 가까이 덮어써서 motion 감속
+        self._publish_target(stamp, 0.3, 0.0)
 
         self._ped_timer -= 1
 
@@ -359,7 +362,7 @@ class PathPlannerNode(Node):
             for ox, oy, _r in self._obstacles:
                 if ox > PED_X_MAX or ox < 0.3:
                     continue
-                if _r >= 0.4:
+                if _r < 0.1 or _r >= 0.4:
                     continue
                 center_y = float(np.polyval(self._lane_center_coef, ox))
                 if abs(oy - center_y) < PED_ROAD_HALF_WIDTH:
