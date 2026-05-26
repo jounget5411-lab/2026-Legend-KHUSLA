@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-YOLO 검출 노드 — best.pt(YOLOv8n-seg)로 세그멘테이션 검출.
+YOLO 검출 노드 — best.pt(YOLOv8n-detect)로 객체 검출.
 
 좌표 변환(H)은 하지 않음 — 원본 카메라 픽셀(u,v) + cls_id를 발행.
-H 변환은 integration_node가 담당.
+거리 판단은 path_planner가 v 픽셀 임계값(bbox 아래 끝)으로 처리.
 
 구독: /usb_cam/image_raw/front (Image, rgb8 640×480)
 발행:
-  /detect/road_pixels (PoseArray) — H변환 필요한 클래스: LANE(6), MID(8),
-     CHILD_LANE(2), STOP(10), GOAL(4). x=u, y=v, z=cls_id
-  /detect/events_raw (PoseArray) — 플래그용 클래스: RED(9), YELLOW(11),
-     GREEN(5), LEFT(7), CHILD_START(3), CHILD_END(1). z=cls_id만 의미 있음.
-     frontview(0)는 버림.
+  /detect/road_pixels (PoseArray) — 위치가 의미 있는 객체. 한 detection당 1점.
+     x = u_center (bbox 좌우 중심)
+     y = v_bottom (bbox 아래 끝 — 카메라에서 가까울수록 큰 값, 거리 proxy)
+     z = cls_id
+     포함 클래스: STOP(14), CROSSROAD_OUT(4), GOAL(5),
+                 HUMAN(8), BLACK_CAR(0), GREEN_CAR(7)
+  /detect/events_raw (PoseArray) — 존재 여부만 의미 있는 플래그.
+     z = cls_id (x, y는 의미 없음)
+     포함 클래스: GREEN(6), RED(13), YELLOW(15), LEFT(10),
+                 CHILD_START(3), CHILD_END(1), POLICE(12)
 
-클래스 매핑:
-  0=frontview 1=CHILD_END 2=CHILD_LANE 3=CHILD_START 4=GOAL
-  5=GREEN 6=LANE 7=LEFT 8=MID 9=RED 10=STOP 11=YELLOW
+차선 클래스(LANE=9, MID=11, CHILD_LANE=2)는 OpenCV(lane_detect_node)가 담당
+하므로 무시.
+
+클래스 매핑 (best.pt 학습 시점 기준):
+  0=BLACK_CAR  1=CHILD_END  2=CHILD_LANE  3=CHILD_START
+  4=CROSSROAD_OUT  5=GOAL  6=GREEN  7=GREEN_CAR  8=HUMAN
+  9=LANE  10=LEFT  11=MID  12=POLICE  13=RED  14=STOP  15=YELLOW
 """
 
 import os
@@ -33,19 +42,16 @@ from ultralytics import YOLO
 
 CAM_FRONT_FRAME = "usb_cam_front"
 
-# H변환이 필요한 클래스 (도로 위 위치 의미 있음)
-ROAD_CLASS_IDS = {2, 4, 6, 8, 10}  # CHILD_LANE, GOAL, LANE, MID, STOP
+# 위치(픽셀) 정보가 의미 있는 클래스 — bbox 1점 발행
+# STOP/CROSSROAD_OUT/GOAL: 도로 위 마킹, bbox 아래 끝(y2) = 거리 proxy
+# HUMAN/BLACK_CAR/GREEN_CAR: 객체, bbox 아래 끝 = 발치 = 거리 proxy
+DETECT_CLASS_IDS = {0, 1, 3, 4, 5, 7, 8, 14}  # CHILD_START(3), CHILD_END(1) 추가 — v 거리 필요
 
-# 차선류 — 카메라에서 세로 방향 띠라서 행(v)별 centroid로 두께를 압축한다.
-# 두께 안 픽셀 전부를 발행하면 polyfit이 가까운(두꺼운) 영역으로 끌려가
-# 곡률이 평탄해지므로, 한 v당 한 점으로 줄여 가까운/먼 영역 가중을 평등화.
-LANE_CLASS_IDS = {2, 6, 8}          # CHILD_LANE, LANE, MID
+# 존재 여부만 의미 있는 플래그 클래스 — cls_id만 발행
+EVENT_CLASS_IDS = {6, 10, 12, 13, 15}
 
-# 플래그용 클래스 (감지 여부만 의미 있음)
-EVENT_CLASS_IDS = {1, 3, 5, 7, 9, 11}  # CHILD_END, CHILD_START, GREEN, LEFT, RED, YELLOW
-
-# 마스크 픽셀 서브샘플 — 차선류가 아닌 도로 클래스(STOP/GOAL)에만 적용
-PIXEL_SUBSAMPLE = 3
+# 명시적으로 무시할 클래스 (OpenCV 차선 검출이 담당)
+IGNORE_CLASS_IDS = {2, 9, 11}  # CHILD_LANE, LANE, MID
 
 # 기본 모델 경로 — 워크스페이스 src 절대경로
 DEFAULT_MODEL_PATH = os.path.join(
@@ -82,7 +88,7 @@ class YoloDetectNode(Node):
         self._pub_road = self.create_publisher(PoseArray, "/detect/road_pixels", 10)
         self._pub_events = self.create_publisher(PoseArray, "/detect/events_raw", 10)
 
-        self.get_logger().info("yolo_detect_node started")
+        self.get_logger().info("yolo_detect_node started (detect mode)")
 
     def _on_image(self, msg: Image):
         if msg.encoding != "rgb8":
@@ -106,51 +112,25 @@ class YoloDetectNode(Node):
         events_out.header.frame_id = CAM_FRONT_FRAME
 
         r = results[0] if results else None
-        if r is not None and r.masks is not None and r.boxes is not None:
-            masks = r.masks.data.cpu().numpy()
+        if r is not None and r.boxes is not None and len(r.boxes) > 0:
+            boxes = r.boxes.xyxy.cpu().numpy()       # (N, 4): x1, y1, x2, y2
             classes = r.boxes.cls.cpu().numpy().astype(int)
-            img_h, img_w = img.shape[:2]
 
-            for mask, cls_id in zip(masks, classes):
+            for bbox, cls_id in zip(boxes, classes):
                 cls_id = int(cls_id)
-                if cls_id == 0:  # frontview → 버림
+
+                if cls_id in IGNORE_CLASS_IDS:
                     continue
 
-                if cls_id in ROAD_CLASS_IDS:
-                    mh, mw = mask.shape
-                    bin_mask = mask > 0.5
-
-                    if cls_id in LANE_CLASS_IDS:
-                        # 행별 centroid: 각 v에서 마스크 두께(u 방향)의 중심선만 남김.
-                        row_counts = bin_mask.sum(axis=1)
-                        rows = np.where(row_counts > 0)[0]
-                        if rows.size == 0:
-                            continue
-                        u_idx = np.arange(mw, dtype=np.float64)
-                        row_u_sum = (bin_mask * u_idx).sum(axis=1)
-                        us = row_u_sum[rows] / row_counts[rows]
-                        vs = rows.astype(np.float64)
-                    else:
-                        vs, us = np.where(bin_mask)
-                        if us.size == 0:
-                            continue
-                        vs = vs[::PIXEL_SUBSAMPLE]
-                        us = us[::PIXEL_SUBSAMPLE]
-
-                    # YOLO seg 마스크는 보통 (160×160) 등 다운샘플 해상도 →
-                    # 입력 이미지 해상도로 numpy 스케일링 (cv2.resize 대체).
-                    if mw != img_w or mh != img_h:
-                        sx = float(img_w) / float(mw)
-                        sy = float(img_h) / float(mh)
-                        us = us.astype(np.float32) * sx
-                        vs = vs.astype(np.float32) * sy
-                    cls_f = float(cls_id)
-                    for u, v in zip(us, vs):
-                        p = Pose()
-                        p.position.x = float(u)
-                        p.position.y = float(v)
-                        p.position.z = cls_f
-                        road_out.poses.append(p)
+                if cls_id in DETECT_CLASS_IDS:
+                    x1, y1, x2, y2 = bbox
+                    u_center = float((x1 + x2) * 0.5)
+                    v_bottom = float(y2)
+                    p = Pose()
+                    p.position.x = u_center
+                    p.position.y = v_bottom
+                    p.position.z = float(cls_id)
+                    road_out.poses.append(p)
 
                 elif cls_id in EVENT_CLASS_IDS:
                     p = Pose()

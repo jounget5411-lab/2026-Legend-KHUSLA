@@ -12,6 +12,7 @@
 import sys
 import os
 import time
+import math
 import tty
 import termios
 import threading
@@ -49,6 +50,7 @@ HELP_TEXT = """
   1~5     : angle 고정 (20/40/60/80/100)
   6       : angle = 0 (직진)
   M       : 기록 ON/OFF (조향 측정)
+  I       : IMU heading 기록 ON/OFF (imu_heading.txt)
   C       : 트랙 폭 측정
   Ctrl+C  : 종료
 ========================================
@@ -87,6 +89,10 @@ class KeyControlNode(Node):
         self._imu_yaw_rate = 0.0
         self._imu_ax = 0.0
         self._imu_ay = 0.0
+        self._imu_yaw_deg = 0.0
+
+        self._imu_recording = False
+        self._imu_file = None
 
         self._pub_auto = self.create_publisher(Bool, "/auto_mode", 10)
         self._pub_motor = self.create_publisher(XycarMotor, "/xycar_motor", 10)
@@ -114,6 +120,10 @@ class KeyControlNode(Node):
         self._imu_yaw_rate = msg.angular_velocity.z
         self._imu_ax = msg.linear_acceleration.x
         self._imu_ay = msg.linear_acceleration.y
+        q = msg.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._imu_yaw_deg = math.degrees(math.atan2(siny, cosy))
 
     def _publish_motor(self):
         if self._auto_mode:
@@ -126,6 +136,10 @@ class KeyControlNode(Node):
         self._pub_motor.publish(msg)
 
     def _record_tick(self):
+        if self._imu_recording and self._imu_file is not None:
+            line = f"{time.time():.3f}\t{self._imu_yaw_deg:+8.2f}\n"
+            self._imu_file.write(line)
+            self._imu_file.flush()
         if not self._recording or self._record_file is None:
             return
         v = self._odom_v
@@ -178,6 +192,10 @@ class KeyControlNode(Node):
             self._toggle_record()
             return
 
+        if key in ('i', 'I'):
+            self._toggle_imu_record()
+            return
+
         if key in ANGLE_PRESETS:
             self._angle = ANGLE_PRESETS[key]
             print(f"\r  >>> angle FIXED = {self._angle:+.0f}          ")
@@ -202,6 +220,21 @@ class KeyControlNode(Node):
             self._speed = 0.0
 
         self._show_state()
+
+    def _toggle_imu_record(self):
+        if self._imu_recording:
+            self._imu_recording = False
+            if self._imu_file:
+                path = self._imu_file.name
+                self._imu_file.close()
+                self._imu_file = None
+                print(f"\r  >>> IMU RECORD OFF — saved: {path}          ")
+        else:
+            path = os.path.expanduser("~/xycar_ws/imu_heading.txt")
+            self._imu_file = open(path, 'a')
+            self._imu_file.write(f"# time\tyaw_deg (started {time.strftime('%H:%M:%S')})\n")
+            self._imu_recording = True
+            print(f"\r  >>> IMU RECORD ON — {path} (10Hz)          ")
 
     def _show_state(self):
         rec = " [REC]" if self._recording else ""
@@ -231,6 +264,8 @@ def main(args=None):
     finally:
         if node._recording and node._record_file:
             node._record_file.close()
+        if node._imu_recording and node._imu_file:
+            node._imu_file.close()
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
         node.destroy_node()
         rclpy.shutdown()

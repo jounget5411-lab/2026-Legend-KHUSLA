@@ -24,9 +24,14 @@
 
 import numpy as np
 
+import math
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Bool
 
 # LANE 모드: 친구 plan() + 헬퍼 (lane_planner.py = 친구 path_planner_node.py 원본)
 from .lane_planner import plan as lane_plan
@@ -52,7 +57,7 @@ CONE_FIT_CURVE_MAX = 1.5
 CONE_FIT_SLOPE_MAX = 3.0
 CONE_LEFT_ACCEPT_DIST = 1.5
 CONE_FIT_SMOOTH_ALPHA = 0.20
-CONE_FIT_MAX_MISS = 20
+CONE_FIT_MAX_MISS = 14
 
 CONE_SAMPLE_X_START = 0.5
 CONE_SAMPLE_X_END = 6.0
@@ -61,23 +66,70 @@ CONE_SAMPLE_N = 25
 CONE_TO_LANE_MISS = 30
 CONE_GRACE_TICKS = 20          # 2초 (20Hz)
 
-# ======================== YOLO 이벤트 cls_id ========================
+# ======================== YOLO 클래스 ID (best.pt 학습 시점 기준) ========================
+# 0=BLACK_CAR  1=CHILD_END  2=CHILD_LANE  3=CHILD_START
+# 4=CROSSROAD_OUT  5=GOAL  6=GREEN  7=GREEN_CAR  8=HUMAN
+# 9=LANE  10=LEFT  11=MID  12=POLICE  13=RED  14=STOP  15=YELLOW
 
-GREEN_CLS_ID = 5
-RED_CLS_ID = 9
-YELLOW_LIGHT_CLS_ID = 11
-LEFT_SIGN_CLS_ID = 7
+# /detect/events_raw 에서 보는 플래그류
+GREEN_CLS_ID = 6
+RED_CLS_ID = 13
+YELLOW_LIGHT_CLS_ID = 15
+LEFT_SIGN_CLS_ID = 10
 CHILD_START_CLS_ID = 3
 CHILD_END_CLS_ID = 1
+POLICE_CLS_ID = 12
+
+# /detect/road_pixels 에서 보는 위치 의미 있는 객체 (bbox bottom v = 거리 proxy)
+STOP_CLS_ID = 14
+CROSSROAD_CLS_ID = 4
+GOAL_CLS_ID = 5
+HUMAN_CLS_ID = 8
+
+EVT_NAMES = {
+    6: "GREEN", 13: "RED", 15: "YELLOW", 10: "LEFT",
+    12: "POLICE", 3: "CHILD_START", 1: "CHILD_END",
+}
+
+# ======================== SHORTCUT (지름길 좌회전) 상수 ========================
+# 진입: 정지선 충분히 가까움 + POLICE 없음 → WAITING (정지, LEFT 대기)
+# WAITING → LEFT 신호 검출 → TURNING_1 (좌측 호 강제, 2초)
+# TURNING_1 → FOLLOW (지름길 차선 추종, _tick_lane 재사용)
+# FOLLOW → CROSSROAD 가까움 OR 15s timeout → TURNING_2 (좌측 호, 2초) → LANE 복귀
+
+STOP_V_THRESHOLD = 320.0          # 480p 기준, 정지선 bbox bottom v가 이 이상이면 가까움
+CROSS_V_THRESHOLD = 278.0         # 480p 기준, CROSSROAD_OUT bbox bottom v 임계 (작을수록 멀리서 트리거)
+STOP_HEADING_TARGET = 0.0         # 정지선 있는 직선 구간 heading (도)
+STOP_HEADING_TOL = 10.0           # ±허용 범위 (도) — 이 밖이면 STOP 무시
+
+SC_TURN_R = 2.5                   # 강제 좌회전 호 반경 (m)
+SC_TURN_DEG = 120.0               # 호 각도 (90보다 크게 → 실제 90도 정도 꺾임)
+SC_TURN_TICKS = 50                # 강제 좌회전 지속 (50 ticks = 2.5초 @ 20Hz)
+SC_ARC_SAMPLE_N = 15              # 호 샘플 점 개수
+
+SC_FOLLOW_HARD_TIMEOUT_TICKS = 300  # FOLLOW에서 CROSSROAD 못 잡으면 15초 후 강제
+SC_BYPASS_COOLDOWN_TICKS = 80       # POLICE 봤을 때 같은 정지선 재트리거 차단 (4초)
+SC_DONE_COOLDOWN_TICKS = 200        # SHORTCUT 한 번 끝난 후 재진입 차단 (10초)
+
+LEFT_SIGNAL_DEBOUNCE_TICKS = 2      # LEFT 신호 최소 검출 회수 (디바운싱)
 
 # ======================== 사람 감지 (PEDESTRIAN) ========================
 
 PED_X_MAX = 8.0             # 전방 이 거리 이내
-PED_ROAD_HALF_WIDTH = 1.75  # center_path 기준 ± 이 폭
+PED_ROAD_HALF_WIDTH = 1.2   # center_path 기준 ± 이 폭 (1.75에서 축소, 도로 경계 오인식 방지)
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
 PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
 PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
 PED_CAR_SPREAD = 1.5        # 클러스터 간 거리 이 이내면 밀집 (차)
+
+# ======================== 어린이 보호구역 (CHILD ZONE) ========================
+
+CHILD_START_V_THR = 200.0        # CHILD_START bbox v 이 이상이면 트리거
+CHILD_END_V_THR = 400.0          # CHILD_END bbox v 이 이상이면 트리거
+CHILD_EXIT_DELAY_TICKS = 60      # END 감지 후 3초 뒤 속도 원복 (20Hz)
+CHILD_ENTER_COOLDOWN_TICKS = 60  # START 후 3초간 END 무시 (오인식 방지)
+CHILD_EXIT_COOLDOWN_TICKS = 200  # END 후 10초간 START 무시 (재진입 방지)
+CHILD_HARD_TIMEOUT_TICKS = 340   # 17초 후 강제 해제 (20Hz)
 
 # ======================== 헬퍼 ========================
 
@@ -112,6 +164,8 @@ class PathPlannerNode(Node):
         super().__init__("path_planner_node")
 
         self.phase = "IDLE"  # 시뮬 연결 전
+        self._wait_green_ticks = 0       # WAIT에서 GREEN 감지 후 카운트
+        self._start_grace_ticks = 0      # 출발 후 STOP 무시 타이머 (20초)
 
         # CONE 데이터
         self._obstacles = []
@@ -122,6 +176,24 @@ class PathPlannerNode(Node):
         # PEDESTRIAN
         self._ped_timer = 0
         self._ped_cooldown = 0
+
+        # SHORTCUT (지름길 좌회전)
+        self._stop_max_v = None          # /detect/road_pixels의 STOP bbox bottom v 최댓값
+        self._cross_max_v = None         # /detect/road_pixels의 CROSSROAD_OUT bbox bottom v 최댓값
+        self._sc_sub = None              # None | "WAITING" | "TURNING_1" | "FOLLOW" | "TURNING_2"
+        self._sc_tick = 0                # 현재 sub-state에서 머무른 틱 수
+        self._sc_cooldown = 0            # 재트리거 차단 카운터
+        self._left_signal_hits = 0       # LEFT 디바운싱용 누적 카운트
+        self._red_stopping = False       # RED + 정지선 정지 중 플래그 (로그 중복 방지)
+
+        # 어린이 보호구역
+        self._child_zone = False
+        self._child_start_max_v = None
+        self._child_end_max_v = None
+        self._child_enter_cooldown = 0   # START 후 END 무시 카운터
+        self._child_exit_cooldown = 0    # END 후 START 무시 카운터
+        self._child_exit_timer = 0       # END 감지 후 지연 원복 타이머
+        self._child_total_ticks = 0      # child zone 진입 후 총 틱
 
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
@@ -136,10 +208,19 @@ class PathPlannerNode(Node):
         # LANE 모드 중앙선 (사람 감지 기준선)
         self._lane_center_coef = None
 
+        # IMU heading
+        self._heading_deg = 0.0
+
         # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
         self.create_subscription(PoseArray, "/fused/lane", self._on_lane, 10)
         self.create_subscription(PoseArray, "/detect/events_raw", self._on_events, 10)
+        # SHORTCUT용 YOLO 객체 픽셀 (STOP, CROSSROAD_OUT 거리 트리거)
+        self.create_subscription(PoseArray, "/detect/road_pixels", self._on_road, 10)
+        self.create_subscription(Imu, "/imu", self._on_imu, qos_profile_sensor_data)
+        # 수동 좌회전 트리거 (모델 LEFT 미인식 임시 대체)
+        self.create_subscription(Bool, "/sc_go", self._on_sc_go, 10)
+        self._sc_go_flag = False
 
         # 발행
         self._pub_center = self.create_publisher(PoseArray, "/center_path", 10)
@@ -147,8 +228,11 @@ class PathPlannerNode(Node):
         self._pub_left = self.create_publisher(PoseArray, "/lane_left", 10)
         self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
         self._pub_fits = self.create_publisher(PoseArray, "/lane_fits", 10)
-        from std_msgs.msg import Bool
         self._pub_estop = self.create_publisher(Bool, "/emergency_stop", 10)
+        self._pub_lturn1 = self.create_publisher(Bool, "/left_turn1", 10)
+        self._pub_lturn2 = self.create_publisher(Bool, "/left_turn2", 10)
+        self._pub_child = self.create_publisher(Bool, "/child_zone", 10)
+        self._pub_slow = self.create_publisher(Bool, "/slow_after_turn", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self._log_counter = 0
@@ -185,6 +269,42 @@ class PathPlannerNode(Node):
     def _on_events(self, msg: PoseArray):
         self._events = [int(p.position.z) for p in msg.poses]
 
+    def _on_road(self, msg: PoseArray):
+        """YOLO 객체 픽셀 — bbox bottom v 추출 (거리 proxy)."""
+        stop_v = None
+        cross_v = None
+        cs_v = None
+        ce_v = None
+        for p in msg.poses:
+            cls = int(p.position.z)
+            v_bot = float(p.position.y)
+            if cls == STOP_CLS_ID:
+                if stop_v is None or v_bot > stop_v:
+                    stop_v = v_bot
+            elif cls == CROSSROAD_CLS_ID:
+                if cross_v is None or v_bot > cross_v:
+                    cross_v = v_bot
+            elif cls == CHILD_START_CLS_ID:
+                if cs_v is None or v_bot > cs_v:
+                    cs_v = v_bot
+            elif cls == CHILD_END_CLS_ID:
+                if ce_v is None or v_bot > ce_v:
+                    ce_v = v_bot
+        self._stop_max_v = stop_v
+        self._cross_max_v = cross_v
+        self._child_start_max_v = cs_v
+        self._child_end_max_v = ce_v
+
+    def _on_imu(self, msg: Imu):
+        q = msg.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._heading_deg = math.degrees(math.atan2(siny, cosy))
+
+    def _on_sc_go(self, msg: Bool):
+        if msg.data:
+            self._sc_go_flag = True
+
     # ---- 메인 틱 ----
 
     def _tick(self):
@@ -200,31 +320,65 @@ class PathPlannerNode(Node):
         elif self.phase == "CONE":
             self._tick_cone(stamp)
         elif self.phase == "LANE":
+            if self._start_grace_ticks > 0:
+                self._start_grace_ticks -= 1
+            self._tick_child_zone()
             self._check_pedestrian()
+            if self._start_grace_ticks <= 0:
+                if self._check_red_stop(stamp):
+                    return
+                self._check_shortcut()
             self._tick_lane(stamp)
         elif self.phase == "PEDESTRIAN":
             self._tick_pedestrian(stamp)
+        elif self.phase == "SHORTCUT":
+            self._tick_shortcut(stamp)
 
         # 로그
         self._log_counter += 1
         if self._log_counter >= PLAN_HZ:
             self._log_counter = 0
-            self.get_logger().info(f"phase={self.phase}")
+            extra = ""
+            if self.phase == "SHORTCUT":
+                extra = (f" sub={self._sc_sub} tick={self._sc_tick}"
+                         f" left_hits={self._left_signal_hits}")
+            if self._stop_max_v is not None:
+                extra += f" stop_v={self._stop_max_v:.0f}"
+            if self._cross_max_v is not None:
+                extra += f" cross_v={self._cross_max_v:.0f}"
+            extra += f" hdg={self._heading_deg:+.1f}"
+            if self._child_zone:
+                extra += " CHILD_ZONE"
+            evts = [EVT_NAMES.get(e, str(e)) for e in self._events
+                    if e in EVT_NAMES]
+            if evts:
+                extra += f" evts={evts}"
+            self.get_logger().info(f"phase={self.phase}{extra}")
 
     # ---- WAIT ----
 
     def _tick_wait(self, stamp):
-        from std_msgs.msg import Bool
-        # 경로생성은 하되 motion 정지 (viewer에서 보이게)
         self._tick_lane(stamp)
         self._pub_estop.publish(Bool(data=True))
 
+        if self._wait_green_ticks > 0:
+            self._wait_green_ticks -= 1
+            if self._wait_green_ticks <= 0:
+                self.get_logger().info("GREEN delay done → CONE")
+                self.phase = "CONE"
+                self._cone_grace = CONE_GRACE_TICKS
+                self._cone_miss = 0
+                self._start_grace_ticks = 400  # 출발 후 20초간 STOP 무시
+                self._pub_estop.publish(Bool(data=False))
+            elif self._wait_green_ticks % PLAN_HZ == 0:
+                self.get_logger().info(
+                    f"[WAIT] GREEN seen, departing in {self._wait_green_ticks} ticks")
+            return
+
         if GREEN_CLS_ID in self._events:
-            self.get_logger().info("GREEN detected → CONE")
-            self.phase = "CONE"
-            self._cone_grace = CONE_GRACE_TICKS
-            self._cone_miss = 0
-            self._pub_estop.publish(Bool(data=False))
+            self._wait_green_ticks = 80  # 4초 (20Hz)
+
+            self.get_logger().info("GREEN detected → departing in 4.5s")
 
     # ---- CONE ----
 
@@ -239,6 +393,7 @@ class PathPlannerNode(Node):
             all_x, all_y = all_x[roi], all_y[roi]
 
         left_fit = None
+        self._cone_left_count = 0
         if all_x.size >= CONE_FIT_MIN_POINTS:
             if self._cone_prev_fit is not None:
                 expected_y = np.polyval(self._cone_prev_fit, all_x)
@@ -249,6 +404,7 @@ class PathPlannerNode(Node):
                 method = "y>0"
 
             lx, ly = all_x[left_mask], all_y[left_mask]
+            self._cone_left_count = lx.size
             # 디버그: 모든 콘 + 왼쪽 판별 결과
             self.get_logger().info(
                 f"[CONE_DBG] method={method} all={list(zip([f'{x:.1f}' for x in all_x],[f'{y:.1f}' for y in all_y]))} "
@@ -304,6 +460,8 @@ class PathPlannerNode(Node):
 
         center_coef = left_fit.copy()
         center_coef[2] -= TRACK_HALF_WIDTH
+        if self._cone_left_count <= 1:
+            center_coef[1] -= 0.268  # 시계방향 15도 (tan15°≈0.268), 콘 1개 이하일 때만
 
         left_ys = np.polyval(left_fit, sample_xs)
         center_ys = np.clip(np.polyval(center_coef, sample_xs), -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
@@ -316,6 +474,56 @@ class PathPlannerNode(Node):
         target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
                                  -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
         self._publish_target(stamp, TARGET_X, target_y)
+
+    # ---- CHILD ZONE: 어린이 보호구역 속도 제한 ----
+
+    def _tick_child_zone(self):
+        """어린이 보호구역 진입/해제 판단. 매 틱 호출."""
+        # 쿨다운 감소
+        if self._child_enter_cooldown > 0:
+            self._child_enter_cooldown -= 1
+        if self._child_exit_cooldown > 0:
+            self._child_exit_cooldown -= 1
+
+        if not self._child_zone:
+            # 진입 판단
+            if self._child_exit_cooldown > 0:
+                return
+            if (self._child_start_max_v is not None
+                    and self._child_start_max_v >= CHILD_START_V_THR):
+                self._child_zone = True
+                self._child_enter_cooldown = CHILD_ENTER_COOLDOWN_TICKS
+                self._child_exit_timer = 0
+                self._child_total_ticks = 0
+                self._pub_child.publish(Bool(data=True))
+                self.get_logger().info(
+                    f"CHILD_ZONE enter (v={self._child_start_max_v:.0f})")
+        else:
+            self._child_total_ticks += 1
+            # hard timeout
+            if self._child_total_ticks >= CHILD_HARD_TIMEOUT_TICKS:
+                self._child_zone = False
+                self._child_exit_cooldown = CHILD_EXIT_COOLDOWN_TICKS
+                self._pub_child.publish(Bool(data=False))
+                self.get_logger().info("CHILD_ZONE forced exit (15s timeout)")
+                return
+            # 해제 판단
+            if self._child_exit_timer > 0:
+                self._child_exit_timer -= 1
+                if self._child_exit_timer <= 0:
+                    self._child_zone = False
+                    self._child_exit_cooldown = CHILD_EXIT_COOLDOWN_TICKS
+                    self._pub_child.publish(Bool(data=False))
+                    self.get_logger().info("CHILD_ZONE exit (delay done)")
+                return
+            if self._child_enter_cooldown > 0:
+                return
+            if (self._child_end_max_v is not None
+                    and self._child_end_max_v >= CHILD_END_V_THR):
+                self._child_exit_timer = CHILD_EXIT_DELAY_TICKS
+                self.get_logger().info(
+                    f"CHILD_END near (v={self._child_end_max_v:.0f}) "
+                    f"→ exit in {CHILD_EXIT_DELAY_TICKS} ticks")
 
     # ---- PEDESTRIAN: 사람 감지 → 정지 → 도로 밖으로 나가면 출발 ----
 
@@ -330,7 +538,7 @@ class PathPlannerNode(Node):
         # 도로 안 작은 클러스터 모으기 (r < 0.4 = 사람 크기)
         road_obs = []
         for ox, oy, _r in self._obstacles:
-            if ox > PED_X_MAX or ox < 0.3:
+            if ox > PED_X_MAX or ox < 1.5:
                 continue
             if _r < 0.1 or _r >= 0.4:
                 continue  # 너무 작으면(점1개=노이즈/꼬깔) 무시, 너무 크면(차/나무) 무시
@@ -404,6 +612,193 @@ class PathPlannerNode(Node):
         self._pub_estop.publish(Bool(data=False))
         self._ped_cooldown = PED_COOLDOWN_TICKS
         self.phase = "LANE"
+
+    # ====================================================================
+    # SHORTCUT: 정지선 좌회전 지름길 — PEDESTRIAN 패턴 그대로 따라감
+    # 진입: LANE 안 _check_shortcut()가 STOP_v ≥ 임계 + POLICE 없음 확인
+    # sub-state: WAITING → TURNING_1 → FOLLOW → TURNING_2 → LANE 복귀
+    # ====================================================================
+
+    def _heading_ok_for_stop(self):
+        """heading이 정지선 방향 범위 안인지 확인."""
+        diff = abs(self._heading_deg - STOP_HEADING_TARGET)
+        if diff > 180:
+            diff = 360 - diff
+        return diff <= STOP_HEADING_TOL
+
+    def _check_red_stop(self, stamp):
+        """정지선 가까이 + GREEN 아님 → 정지. GREEN 뜨면 해제. True 반환 시 이번 틱 종료."""
+        if (self._stop_max_v is None or self._stop_max_v < STOP_V_THRESHOLD
+                or not self._heading_ok_for_stop()):
+            if self._red_stopping:
+                self._pub_estop.publish(Bool(data=False))
+                self.get_logger().info("stopline gone → GO")
+                self._red_stopping = False
+            return False
+        # 정지선 가까이 + heading OK
+        if GREEN_CLS_ID in self._events:
+            if self._red_stopping:
+                self._pub_estop.publish(Bool(data=False))
+                self.get_logger().info("GREEN at stopline → GO")
+                self._red_stopping = False
+            return False
+        # GREEN 없음 → 정지
+        if not self._red_stopping:
+            self.get_logger().info(
+                f"stopline (v={self._stop_max_v:.0f}) no GREEN → STOP")
+            self._red_stopping = True
+        self._pub_estop.publish(Bool(data=True))
+        self._tick_lane(stamp)
+        return True
+
+    def _check_shortcut(self):
+        """LANE 주행 중 정지선이 충분히 가까우면 SHORTCUT 진입 판단."""
+        if self._sc_cooldown > 0:
+            self._sc_cooldown -= 1
+            return
+        if self._stop_max_v is None:
+            return
+        if self._stop_max_v < STOP_V_THRESHOLD:
+            return
+        if not self._heading_ok_for_stop():
+            return
+
+        # POLICE 보이면 지름길 포기 — 같은 정지선 다시 안 트리거하게 쿨다운
+        if POLICE_CLS_ID in self._events:
+            self._sc_cooldown = SC_BYPASS_COOLDOWN_TICKS
+            self.get_logger().info(
+                f"POLICE detected at stopline (v={self._stop_max_v:.0f}) "
+                f"→ bypass shortcut ({SC_BYPASS_COOLDOWN_TICKS} tick cooldown)")
+            return
+
+        # 진입
+        self.phase = "SHORTCUT"
+        self._sc_sub = "WAITING"
+        self._sc_tick = 0
+        self._left_signal_hits = 0
+        self._pub_estop.publish(Bool(data=True))
+        self.get_logger().info(
+            f"STOP near (v={self._stop_max_v:.0f}) + no POLICE → SHORTCUT.WAITING")
+
+    def _tick_shortcut(self, stamp):
+        """SHORTCUT sub-state dispatch."""
+        if self._sc_sub == "WAITING":
+            self._tick_sc_waiting(stamp)
+        elif self._sc_sub == "TURNING_1":
+            self._tick_sc_turning(stamp, after="FOLLOW")
+        elif self._sc_sub == "FOLLOW":
+            self._tick_sc_follow(stamp)
+        elif self._sc_sub == "TURNING_2":
+            self._tick_sc_turning(stamp, after="LANE")
+        else:
+            # 알 수 없는 sub — 안전망
+            self.get_logger().warn(f"Unknown sc_sub={self._sc_sub} → LANE 복귀")
+            self._exit_shortcut_to_lane()
+
+    def _tick_sc_waiting(self, stamp):
+        """정지하고 LEFT 신호 대기."""
+        self._pub_estop.publish(Bool(data=True))
+        self._tick_lane(stamp)
+        self._sc_tick += 1
+
+        if LEFT_SIGN_CLS_ID in self._events:
+            self._left_signal_hits += 1
+        else:
+            self._left_signal_hits = max(0, self._left_signal_hits - 1)
+
+        if self._sc_tick % PLAN_HZ == 0:
+            evt_names = [EVT_NAMES.get(e, str(e)) for e in self._events
+                         if e in EVT_NAMES]
+            self.get_logger().info(
+                f"[SC_WAIT] tick={self._sc_tick} LEFT_hits={self._left_signal_hits}"
+                f"/{LEFT_SIGNAL_DEBOUNCE_TICKS} evts={evt_names}")
+
+        if self._left_signal_hits >= LEFT_SIGNAL_DEBOUNCE_TICKS:
+            self._pub_estop.publish(Bool(data=False))
+            self._sc_sub = "TURNING_1"
+            self._sc_tick = 0
+            self.get_logger().info(
+                f"LEFT signal confirmed ({self._left_signal_hits} hits) → TURNING_1")
+
+    def _tick_sc_turning(self, stamp, after):
+        """좌회전: motion_node에 /left_turn1 or /left_turn2 신호."""
+        if self._sc_tick == 0:
+            if after == "FOLLOW":
+                self._pub_lturn1.publish(Bool(data=True))
+            else:
+                self._pub_lturn2.publish(Bool(data=True))
+        self._sc_tick += 1
+
+        ticks = SC_TURN_TICKS
+        if self._sc_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[SC_TURN] tick={self._sc_tick}/{ticks} after={after}")
+
+        if self._sc_tick >= ticks:
+            if after == "FOLLOW":
+                self._sc_sub = "FOLLOW"
+                self._sc_tick = 0
+                self.get_logger().info("TURNING_1 done → FOLLOW (지름길 차선 추종)")
+            elif after == "LANE":
+                self.get_logger().info("TURNING_2 done → LANE 복귀")
+                self._exit_shortcut_to_lane()
+
+    def _tick_sc_follow(self, stamp):
+        """지름길 위 차선 추종. CROSSROAD 가까워지거나 timeout이면 TURNING_2."""
+        self._tick_lane(stamp)
+        self._sc_tick += 1
+
+        if self._sc_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[SC_FOLLOW] tick={self._sc_tick}/{SC_FOLLOW_HARD_TIMEOUT_TICKS} "
+                f"cross_v={self._cross_max_v} (thr={CROSS_V_THRESHOLD})")
+
+        if self._cross_max_v is not None and self._cross_max_v >= CROSS_V_THRESHOLD:
+            self._sc_sub = "TURNING_2"
+            self._sc_tick = 0
+            self.get_logger().info(
+                f"CROSSROAD near (v={self._cross_max_v:.0f}) → TURNING_2")
+            return
+
+        # # 종료 조건 2: hard timeout (임시 비활성화)
+        # if self._sc_tick >= SC_FOLLOW_HARD_TIMEOUT_TICKS:
+        #     self._sc_sub = "TURNING_2"
+        #     self._sc_tick = 0
+        #     self.get_logger().warn(
+        #         f"FOLLOW timeout ({SC_FOLLOW_HARD_TIMEOUT_TICKS} ticks) → TURNING_2 (강제)")
+        #     return
+
+    def _exit_shortcut_to_lane(self):
+        """SHORTCUT 종료 → LANE 복귀, 재진입 쿨다운 설정."""
+        self.get_logger().info(
+            f"SHORTCUT done → LANE (cooldown {SC_DONE_COOLDOWN_TICKS} ticks, slow 3s)")
+        self.phase = "LANE"
+        self._sc_sub = None
+        self._sc_tick = 0
+        self._sc_cooldown = SC_DONE_COOLDOWN_TICKS
+        self._left_signal_hits = 0
+        self._pub_estop.publish(Bool(data=False))
+        self._pub_slow.publish(Bool(data=True))
+        # 좌회전 직후 무조건 어린이 보호구역 진입
+        self._child_zone = True
+        self._child_enter_cooldown = CHILD_ENTER_COOLDOWN_TICKS
+        self._child_exit_timer = 0
+        self._child_total_ticks = 0
+        self._pub_child.publish(Bool(data=True))
+        self.get_logger().info("CHILD_ZONE forced after SHORTCUT")
+
+    def _publish_left_arc(self, stamp):
+        """원점에서 좌측으로 휘는 호를 /center_path와 /target으로 발행.
+        theta 기반 파라미터화로 90도 이상 회전 가능.
+        """
+        thetas = np.linspace(0.05, np.radians(SC_TURN_DEG), SC_ARC_SAMPLE_N)
+        xs = SC_TURN_R * np.sin(thetas)          # 전방
+        ys = SC_TURN_R * (1.0 - np.cos(thetas))  # 좌측 (y > 0)
+
+        self._pub_center.publish(_poses_from_xy(stamp, xs, ys))
+        self._pub_left.publish(_poses_from_xy(stamp, xs, ys + 1.0))
+        self._pub_right.publish(_poses_from_xy(stamp, xs, ys - 1.0))
+        self._publish_target(stamp, float(xs[-1]), float(ys[-1]))
 
     # ---- LANE (친구 plan() 그대로) ----
 
