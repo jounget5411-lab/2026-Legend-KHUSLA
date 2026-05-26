@@ -151,8 +151,9 @@ class PathPlannerNode(Node):
         # YOLO 이벤트
         self._events = []
 
-        # LANE 모드 중앙선 (사람 감지 기준선)
+        # LANE 모드 중앙선 (사람/추월 감지 기준선)
         self._lane_center_coef = None
+        self._lane_stable_count = 0  # _tick_lane 성공 횟수
 
         # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
@@ -237,11 +238,17 @@ class PathPlannerNode(Node):
     # ---- WAIT ----
 
     def _tick_wait(self, stamp):
+        from std_msgs.msg import Bool
+        # 경로생성은 하되 motion 정지 (viewer에서 보이게)
+        self._tick_lane(stamp)
+        self._pub_estop.publish(Bool(data=True))
+
         if GREEN_CLS_ID in self._events:
             self.get_logger().info("GREEN detected → CONE")
             self.phase = "CONE"
             self._cone_grace = CONE_GRACE_TICKS
             self._cone_miss = 0
+            self._pub_estop.publish(Bool(data=False))
 
     # ---- CONE ----
 
@@ -301,6 +308,7 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
+                    self._lane_stable_count = 0  # 안정화 카운트 리셋
                     self._tick_lane(stamp)  # 즉시 차선 경로 발행 (경로 끊김 방지)
                     return
                 if self._cone_grace > 0:
@@ -427,9 +435,11 @@ class PathPlannerNode(Node):
     def _check_overtake(self):
         """LANE 주행 중 도로 위 큰 장애물(차) 감지 → OVERTAKE."""
         if self._ped_cooldown > 0:
-            return  # 보행자 쿨다운 중엔 추월 감지 안 함
+            return
         if self._lane_center_coef is None:
             return
+        if self._lane_stable_count < 40:
+            return  # 2초(20Hz×2) 안정화 후에만 추월 감지
 
         big_on_road = 0
         for ox, oy, _r in self._obstacles:
@@ -524,10 +534,11 @@ class PathPlannerNode(Node):
         if result is None:
             return
 
-        # center_path의 coef 저장 (사람 감지 기준선으로 사용)
+        # center_path의 coef 저장 (사람/추월 감지 기준선으로 사용)
         all_fits = result.get("all_fits", [])
         if all_fits:
             self._lane_center_coef = all_fits[0]  # yellow_fit = center
+            self._lane_stable_count += 1
 
         target_x, target_y = result["target"]
         sample_xs = result["sample_xs"]
