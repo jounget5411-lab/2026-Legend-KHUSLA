@@ -73,7 +73,7 @@ CHILD_END_CLS_ID = 1
 # ======================== 사람 감지 (PEDESTRIAN) ========================
 
 PED_X_MAX = 10.0            # 전방 이 거리 이내
-PED_ROAD_HALF_WIDTH = 1.8   # center_path 기준 ± 이 폭
+PED_ROAD_HALF_WIDTH = 1.75  # center_path 기준 ± 이 폭
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
 PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
 PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
@@ -308,14 +308,20 @@ class PathPlannerNode(Node):
         if self._lane_center_coef is None:
             return
 
-        # 도로 안 클러스터 모으기
+        # 도로 안 작은 클러스터 모으기 (r < 0.4 = 사람 크기)
         road_obs = []
         for ox, oy, _r in self._obstacles:
             if ox > PED_X_MAX or ox < 0.3:
                 continue
+            if _r >= 0.4:
+                continue  # 큰 클러스터 = 차/꼬깔/나무 → 무시
             center_y = float(np.polyval(self._lane_center_coef, ox))
-            if abs(oy - center_y) <= PED_ROAD_HALF_WIDTH:
+            dist = abs(oy - center_y)
+            if dist <= PED_ROAD_HALF_WIDTH:
                 road_obs.append((ox, oy, _r))
+                self.get_logger().info(
+                    f"[PED_DBG] obs({ox:.1f},{oy:.1f}) r={_r:.2f} "
+                    f"center_y={center_y:.2f} dist={dist:.2f}")
 
         if not road_obs:
             return
