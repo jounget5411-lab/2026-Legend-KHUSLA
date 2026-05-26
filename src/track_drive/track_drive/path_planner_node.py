@@ -52,7 +52,7 @@ CONE_FIT_CURVE_MAX = 1.5
 CONE_FIT_SLOPE_MAX = 3.0
 CONE_LEFT_ACCEPT_DIST = 1.5
 CONE_FIT_SMOOTH_ALPHA = 0.20
-CONE_FIT_MAX_MISS = 8
+CONE_FIT_MAX_MISS = 20
 
 CONE_SAMPLE_X_START = 0.5
 CONE_SAMPLE_X_END = 6.0
@@ -72,7 +72,7 @@ CHILD_END_CLS_ID = 1
 
 # ======================== 사람 감지 (PEDESTRIAN) ========================
 
-PED_X_MAX = 10.0            # 전방 이 거리 이내
+PED_X_MAX = 8.0             # 전방 이 거리 이내
 PED_ROAD_HALF_WIDTH = 1.75  # center_path 기준 ± 이 폭
 PED_MIN_STOP_TICKS = 60     # 최소 정지 시간 (3초, 20Hz)
 PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
@@ -111,7 +111,7 @@ class PathPlannerNode(Node):
     def __init__(self):
         super().__init__("path_planner_node")
 
-        self.phase = "WAIT"
+        self.phase = "IDLE"  # 시뮬 연결 전
 
         # CONE 데이터
         self._obstacles = []
@@ -190,7 +190,12 @@ class PathPlannerNode(Node):
     def _tick(self):
         stamp = self.get_clock().now().to_msg()
 
-        if self.phase == "WAIT":
+        if self.phase == "IDLE":
+            if len(self._obstacles) > 0 or self._has_lane:
+                self.get_logger().info("Sim connected → WAIT")
+                self.phase = "WAIT"
+            return
+        elif self.phase == "WAIT":
             self._tick_wait(stamp)
         elif self.phase == "CONE":
             self._tick_cone(stamp)
@@ -232,10 +237,16 @@ class PathPlannerNode(Node):
             if self._cone_prev_fit is not None:
                 expected_y = np.polyval(self._cone_prev_fit, all_x)
                 left_mask = np.abs(all_y - expected_y) < CONE_LEFT_ACCEPT_DIST
+                method = "track"
             else:
                 left_mask = all_y > 0
+                method = "y>0"
 
             lx, ly = all_x[left_mask], all_y[left_mask]
+            # 디버그: 모든 콘 + 왼쪽 판별 결과
+            self.get_logger().info(
+                f"[CONE_DBG] method={method} all={list(zip([f'{x:.1f}' for x in all_x],[f'{y:.1f}' for y in all_y]))} "
+                f"left={list(zip([f'{x:.1f}' for x in lx],[f'{y:.1f}' for y in ly]))}")
             if lx.size >= CONE_FIT_MIN_POINTS:
                 x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
                 if x_span >= CONE_FIT_MIN_X_SPAN:
@@ -362,7 +373,7 @@ class PathPlannerNode(Node):
         if self._ped_timer > 0:
             return  # 최소 정지 시간 안 지남
 
-        # 도로 안에 작은 장애물 아직 있나?
+        # 사람이 중앙선 왼쪽(y > center_y)으로 넘어갔나?
         if self._lane_center_coef is not None:
             for ox, oy, _r in self._obstacles:
                 if ox > PED_X_MAX or ox < 0.3:
@@ -371,9 +382,19 @@ class PathPlannerNode(Node):
                     continue
                 center_y = float(np.polyval(self._lane_center_coef, ox))
                 if abs(oy - center_y) < PED_ROAD_HALF_WIDTH:
-                    return  # 아직 있음 → 계속 정지
+                    # 도로 안에 있음 — 중앙선 넘었나?
+                    if oy > center_y:
+                        self.get_logger().info(
+                            f"Pedestrian crossed center ({ox:.1f},{oy:.1f}) cy={center_y:.2f} → LANE")
+                        self._pub_estop.publish(Bool(data=False))
+                        self._ped_cooldown = PED_COOLDOWN_TICKS
+                        self.phase = "LANE"
+                        return
+                    else:
+                        return  # 아직 오른쪽 → 계속 정지
 
-        self.get_logger().info("Pedestrian cleared → LANE (cooldown 20s)")
+        # 장애물 사라짐 → 출발
+        self.get_logger().info("Pedestrian gone → LANE (cooldown 20s)")
         self._pub_estop.publish(Bool(data=False))
         self._ped_cooldown = PED_COOLDOWN_TICKS
         self.phase = "LANE"
