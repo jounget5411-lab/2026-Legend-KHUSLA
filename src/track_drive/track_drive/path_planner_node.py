@@ -34,8 +34,6 @@ from .lane_planner import (
     YELLOW_CLS_IDS, WHITE_CLS_IDS, PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
     _polyval_clipped, _sample_xs, _yellow_inlier_xs, _yellow_inlier_ys,
 )
-# OVERTAKE 모드: common.py의 오른쪽 실선 기반 경로
-from .common import LaneMemory, plan_drive_target
 
 # ======================== CONE 상수 ========================
 # 라바콘 구간: 라이다 /fused/obstacles에서 왼쪽 콘 줄을 피팅해
@@ -81,17 +79,6 @@ PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz
 PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
 PED_CAR_SPREAD = 1.5        # 클러스터 간 거리 이 이내면 밀집 (차)
 
-# ======================== 추월 (OVERTAKE) ========================
-
-OVT_X_MAX = 10.0            # 전방 이 거리 이내에서 차 감지
-OVT_ROAD_HALF_WIDTH = 1.75  # 도로 안 판정
-OVT_MIN_R = 0.4             # 이 이상이면 차 (사람은 r<0.4)
-OVT_MIN_CLUSTERS = 2        # 도로 안 큰 클러스터 이 이상이면 차 감지
-OVT_LANE1_CHECK_X = 6.0     # 1차선 차 추월 완료 판단: 이 거리 안에 1차선 장애물 없으면 추월됨
-OVT_LANE1_Y_MIN = 0.5       # 1차선 = center_y 기준 이만큼 왼쪽(y+) 이상
-OVT_RETURN_DELAY = 100      # 추월 완료 후 5초(20Hz) 뒤 1차선 복귀
-OVT_FRONT_CAR_DIST = 5.0    # 또는: 앞에 2차선 차가 이 거리 안에 오면 복귀
-
 # ======================== 헬퍼 ========================
 
 def _poses_from_xy(stamp, xs, ys):
@@ -136,11 +123,6 @@ class PathPlannerNode(Node):
         self._ped_timer = 0
         self._ped_cooldown = 0
 
-        # OVERTAKE
-        self._ovt_memory = LaneMemory()
-        self._ovt_return_timer = 0
-        self._ovt_lane1_gone_count = 0
-
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
         self._yellow_ys = np.array([], dtype=np.float64)
@@ -151,9 +133,8 @@ class PathPlannerNode(Node):
         # YOLO 이벤트
         self._events = []
 
-        # LANE 모드 중앙선 (사람/추월 감지 기준선)
+        # LANE 모드 중앙선 (사람 감지 기준선)
         self._lane_center_coef = None
-        self._lane_stable_count = 0  # _tick_lane 성공 횟수
 
         # 구독
         self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
@@ -220,14 +201,9 @@ class PathPlannerNode(Node):
             self._tick_cone(stamp)
         elif self.phase == "LANE":
             self._check_pedestrian()
-            self._check_overtake()
             self._tick_lane(stamp)
         elif self.phase == "PEDESTRIAN":
             self._tick_pedestrian(stamp)
-        elif self.phase == "OVERTAKE":
-            self._tick_overtake(stamp)
-        elif self.phase == "OVERTAKE_RETURN":
-            self._tick_overtake_return(stamp)
 
         # 로그
         self._log_counter += 1
@@ -308,7 +284,6 @@ class PathPlannerNode(Node):
                     self.get_logger().info(
                         f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
-                    self._lane_stable_count = 0  # 안정화 카운트 리셋
                     self._tick_lane(stamp)  # 즉시 차선 경로 발행 (경로 끊김 방지)
                     return
                 if self._cone_grace > 0:
@@ -430,97 +405,6 @@ class PathPlannerNode(Node):
         self._ped_cooldown = PED_COOLDOWN_TICKS
         self.phase = "LANE"
 
-    # ---- OVERTAKE: 차 감지 → 2차선 주행 → 추월 후 1차선 복귀 ----
-
-    def _check_overtake(self):
-        """LANE 주행 중 도로 위 큰 장애물(차) 감지 → OVERTAKE."""
-        if self._ped_cooldown > 0:
-            return
-        if self._lane_center_coef is None:
-            return
-        if self._lane_stable_count < 40:
-            return  # 2초(20Hz×2) 안정화 후에만 추월 감지
-
-        big_on_road = 0
-        for ox, oy, _r in self._obstacles:
-            if ox > OVT_X_MAX or ox < 0.3:
-                continue
-            if _r < OVT_MIN_R:
-                continue  # 작은 거 = 사람/콘
-            center_y = float(np.polyval(self._lane_center_coef, ox))
-            if abs(oy - center_y) <= OVT_ROAD_HALF_WIDTH:
-                big_on_road += 1
-
-        if big_on_road >= OVT_MIN_CLUSTERS:
-            self.get_logger().info(
-                f"OVERTAKE: {big_on_road} big obstacles on road → 2차선")
-            self._ovt_memory = LaneMemory()
-            self._ovt_lane1_gone_count = 0
-            self._ovt_return_timer = 0
-            self.phase = "OVERTAKE"
-
-    def _tick_overtake(self, stamp):
-        """2차선 주행 (오른쪽 흰선 기반). 1차선 차 사라지면 복귀 준비."""
-        # 오른쪽 흰선 기반 경로 (plan_drive_target)
-        # lane_xs/ys에서 전체 차선 점 사용
-        all_xs = np.concatenate([self._yellow_xs, self._white_xs]) if self._has_lane else np.array([])
-        all_ys = np.concatenate([self._yellow_ys, self._white_ys]) if self._has_lane else np.array([])
-
-        result = plan_drive_target(all_xs, all_ys, self._ovt_memory)
-
-        if result.ok:
-            self._publish_target(stamp, result.target_x, result.target_y)
-            if result.path_xs is not None and len(result.path_xs) >= 2:
-                self._pub_center.publish(
-                    _make_pose_array(stamp, result.path_xs, result.path_ys))
-
-        # 1차선 차 추월 완료 판단: center_y 왼쪽(y+)에 큰 장애물 없으면
-        lane1_car = False
-        if self._lane_center_coef is not None:
-            for ox, oy, _r in self._obstacles:
-                if ox > OVT_LANE1_CHECK_X or ox < 0.3:
-                    continue
-                if _r < OVT_MIN_R:
-                    continue
-                center_y = float(np.polyval(self._lane_center_coef, ox))
-                if oy > center_y + OVT_LANE1_Y_MIN:  # 1차선 = 중앙선 왼쪽
-                    lane1_car = True
-                    break
-
-        if not lane1_car:
-            self._ovt_lane1_gone_count += 1
-        else:
-            self._ovt_lane1_gone_count = 0
-
-        # 1차선 차가 10틱(0.5초) 연속 안 보이면 → 복귀 타이머 시작
-        if self._ovt_lane1_gone_count >= 10:
-            self.get_logger().info("Lane1 car gone → OVERTAKE_RETURN")
-            self._ovt_return_timer = OVT_RETURN_DELAY
-            self.phase = "OVERTAKE_RETURN"
-
-    def _tick_overtake_return(self, stamp):
-        """1차선 복귀 대기. 타이머 후 또는 앞차 접근 시 LANE 복귀."""
-        # 2차선 주행 유지하면서 타이머 카운트
-        self._tick_overtake(stamp)
-        # phase가 다시 OVERTAKE로 바뀌지 않게
-        self.phase = "OVERTAKE_RETURN"
-
-        self._ovt_return_timer -= 1
-
-        # 앞에 2차선 차 접근 체크 (빠른 복귀)
-        front_car = False
-        for ox, oy, _r in self._obstacles:
-            if ox > OVT_FRONT_CAR_DIST or ox < 0.3:
-                continue
-            if _r >= OVT_MIN_R:
-                front_car = True
-                break
-
-        if self._ovt_return_timer <= 0 or front_car:
-            reason = "timer" if self._ovt_return_timer <= 0 else "front car"
-            self.get_logger().info(f"OVERTAKE done ({reason}) → LANE")
-            self.phase = "LANE"
-
     # ---- LANE (친구 plan() 그대로) ----
 
     def _tick_lane(self, stamp):
@@ -534,11 +418,10 @@ class PathPlannerNode(Node):
         if result is None:
             return
 
-        # center_path의 coef 저장 (사람/추월 감지 기준선으로 사용)
+        # center_path의 coef 저장 (사람 감지 기준선으로 사용)
         all_fits = result.get("all_fits", [])
         if all_fits:
             self._lane_center_coef = all_fits[0]  # yellow_fit = center
-            self._lane_stable_count += 1
 
         target_x, target_y = result["target"]
         sample_xs = result["sample_xs"]
