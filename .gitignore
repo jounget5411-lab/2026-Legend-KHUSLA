@@ -2,6 +2,14 @@ build/
 install/
 log/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .claude/
 CLAUDE.md
+runs/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.log
