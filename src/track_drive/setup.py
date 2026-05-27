@@ -31,6 +31,8 @@ setup(
             'motion = track_drive.motion_node:main',
             'fused_viewer = track_drive.fused_viewer_node:main',
             'key_control = track_drive.key_control_node:main',
+            'test_white = track_drive.test_white_node:main',
+            'test_viewer = track_drive.test_viewer_node:main',
         ],
     },
 )

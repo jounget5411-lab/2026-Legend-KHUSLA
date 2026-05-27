@@ -30,7 +30,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool
 
 # LANE 모드: 친구 plan() + 헬퍼 (lane_planner.py = 친구 path_planner_node.py 원본)
@@ -131,6 +131,37 @@ CHILD_ENTER_COOLDOWN_TICKS = 60  # START 후 3초간 END 무시 (오인식 방�
 CHILD_EXIT_COOLDOWN_TICKS = 200  # END 후 10초간 START 무시 (재진입 방지)
 CHILD_HARD_TIMEOUT_TICKS = 340   # 17초 후 강제 해제 (20Hz)
 
+# ======================== 추월 (OVERTAKE) ========================
+
+OT_CAR_V_THRESHOLD = 250.0       # BLACK_CAR/GREEN_CAR bbox v 이 이상이면 트리거
+OT_HEADING_MIN = 50.0            # 추월 허용 heading 최소 (도)
+OT_HEADING_MAX = 170.0           # 추월 허용 heading 최대 (도)
+OT_YELLOW_RIGHT_OFFSET = -1.8    # 노란선 기준 오른쪽 1.8m (2차선으로 이동)
+OT_WHITE_LEFT_OFFSET = 0.8       # 오른쪽 흰선 기준 왼쪽 0.8m (2차선 주행)
+OT_WHITE_LEFT_PASSING = 5.5      # 왼쪽 감지 후 흰선 기준 왼쪽 5.5m
+OT_YELLOW_LEFT_OFFSET_1 = 2.0    # 왼쪽 사라진 후 노란선 기준 왼쪽 2.0m
+OT_YELLOW_RIGHT_MERGE = -0.5     # 노란선 기준 오른쪽 0.5m (합류)
+OT_MERGE_TICKS = 40              # 합류 주행 시간 (2초)
+OT_LANE_TO_2ND_TICKS = 120       # 2차선 이동 시간 (6초)
+OT_CAR_PASSED_DELAY_TICKS = 40   # 차 지나간 후 대기 (2초)
+OT_RETURN_TICKS = 60             # 1차선 복귀 시간 (3초 → MERGE)
+OT_LEFT_LIDAR_ANGLE = math.pi / 2   # 왼쪽 90도 (9시)
+OT_LEFT_LIDAR_HALF = 0.15         # ±각도 범위 (rad, ~8도)
+OT_LEFT_LIDAR_R_MIN = 0.5         # 왼쪽 감지 최소 거리 (m)
+OT_LEFT_LIDAR_R_MAX = 3.0         # 왼쪽 감지 최대 거리 (m)
+OT_RIGHT_LIDAR_ANGLE = math.radians(-88.0)  # 오른쪽 88도
+OT_RIGHT_LIDAR_HALF = math.radians(2.0)    # ±2도 (-90~-86도 커버)
+OT_RIGHT_LIDAR_R_MIN = 0.01       # 오른쪽 감지 최소 거리 (m)
+OT_RIGHT_LIDAR_R_MAX = 3.0        # 오른쪽 감지 최대 거리 (m)
+OT_FIT_MIN_POINTS = 5
+OT_OUTLIER_THR = 0.4
+OT_EMA_ALPHA = 0.15
+OT_X_BIN_SIZE = 0.5
+OT_COOLDOWN_TICKS = 400          # 추월 후 20초 재트리거 방지
+
+BLACK_CAR_CLS_ID = 0
+GREEN_CAR_CLS_ID = 7
+
 # ======================== 헬퍼 ========================
 
 def _poses_from_xy(stamp, xs, ys):
@@ -185,6 +216,7 @@ class PathPlannerNode(Node):
         self._sc_cooldown = 0            # 재트리거 차단 카운터
         self._left_signal_hits = 0       # LEFT 디바운싱용 누적 카운트
         self._red_stopping = False       # RED + 정지선 정지 중 플래그 (로그 중복 방지)
+        self._police_seen_ago = 999      # POLICE 마지막 감지 후 틱 수
 
         # 어린이 보호구역
         self._child_zone = False
@@ -194,6 +226,16 @@ class PathPlannerNode(Node):
         self._child_exit_cooldown = 0    # END 후 START 무시 카운터
         self._child_exit_timer = 0       # END 감지 후 지연 원복 타이머
         self._child_total_ticks = 0      # child zone 진입 후 총 틱
+
+        # OVERTAKE (추월)
+        self._ot_sub = None              # None | LANE_TO_2ND | PASSING | CAR_BESIDE | CAR_PASSED | RETURN_TO_1ST
+        self._ot_tick = 0
+        self._ot_cooldown = 0
+        self._ot_right_fit = None        # 오른쪽 흰 실선 피팅
+        self._ot_yellow_fit = None       # 노란 중앙선 피팅
+        self._car_max_v = None           # YOLO 차량 bbox v
+        self._left_side_detected = False # 왼쪽 라이다 감지
+        self._right_side_detected = False # 오른쪽 라이다 감지
 
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
@@ -218,6 +260,7 @@ class PathPlannerNode(Node):
         # SHORTCUT용 YOLO 객체 픽셀 (STOP, CROSSROAD_OUT 거리 트리거)
         self.create_subscription(PoseArray, "/detect/road_pixels", self._on_road, 10)
         self.create_subscription(Imu, "/imu", self._on_imu, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan", self._on_scan, qos_profile_sensor_data)
         # 수동 좌회전 트리거 (모델 LEFT 미인식 임시 대체)
         self.create_subscription(Bool, "/sc_go", self._on_sc_go, 10)
         self._sc_go_flag = False
@@ -233,6 +276,7 @@ class PathPlannerNode(Node):
         self._pub_lturn2 = self.create_publisher(Bool, "/left_turn2", 10)
         self._pub_child = self.create_publisher(Bool, "/child_zone", 10)
         self._pub_slow = self.create_publisher(Bool, "/slow_after_turn", 10)
+        self._pub_slow_merge = self.create_publisher(Bool, "/slow_merge", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self._log_counter = 0
@@ -275,6 +319,7 @@ class PathPlannerNode(Node):
         cross_v = None
         cs_v = None
         ce_v = None
+        car_v = None
         for p in msg.poses:
             cls = int(p.position.z)
             v_bot = float(p.position.y)
@@ -290,16 +335,39 @@ class PathPlannerNode(Node):
             elif cls == CHILD_END_CLS_ID:
                 if ce_v is None or v_bot > ce_v:
                     ce_v = v_bot
+            elif cls in (BLACK_CAR_CLS_ID, GREEN_CAR_CLS_ID):
+                if car_v is None or v_bot > car_v:
+                    car_v = v_bot
         self._stop_max_v = stop_v
         self._cross_max_v = cross_v
         self._child_start_max_v = cs_v
         self._child_end_max_v = ce_v
+        self._car_max_v = car_v
 
     def _on_imu(self, msg: Imu):
         q = msg.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self._heading_deg = math.degrees(math.atan2(siny, cosy))
+
+    def _on_scan(self, msg: LaserScan):
+        """왼쪽/오른쪽 90도 방향 라이다 감지 (추월 시 옆 차량 확인)."""
+        def _check_side(angle, half, r_min, r_max):
+            lo = angle - half
+            hi = angle + half
+            idx_lo = max(0, int((lo - msg.angle_min) / msg.angle_increment))
+            idx_hi = min(len(msg.ranges), int((hi - msg.angle_min) / msg.angle_increment))
+            for i in range(idx_lo, idx_hi):
+                r = msg.ranges[i]
+                if np.isfinite(r) and r_min <= r <= r_max:
+                    return True
+            return False
+        self._left_side_detected = _check_side(
+            OT_LEFT_LIDAR_ANGLE, OT_LEFT_LIDAR_HALF,
+            OT_LEFT_LIDAR_R_MIN, OT_LEFT_LIDAR_R_MAX)
+        self._right_side_detected = _check_side(
+            OT_RIGHT_LIDAR_ANGLE, OT_RIGHT_LIDAR_HALF,
+            OT_RIGHT_LIDAR_R_MIN, OT_RIGHT_LIDAR_R_MAX)
 
     def _on_sc_go(self, msg: Bool):
         if msg.data:
@@ -320,6 +388,10 @@ class PathPlannerNode(Node):
         elif self.phase == "CONE":
             self._tick_cone(stamp)
         elif self.phase == "LANE":
+            if POLICE_CLS_ID in self._events:
+                self._police_seen_ago = 0
+            else:
+                self._police_seen_ago += 1
             if self._start_grace_ticks > 0:
                 self._start_grace_ticks -= 1
             self._tick_child_zone()
@@ -328,11 +400,14 @@ class PathPlannerNode(Node):
                 if self._check_red_stop(stamp):
                     return
                 self._check_shortcut()
+                self._check_overtake()
             self._tick_lane(stamp)
         elif self.phase == "PEDESTRIAN":
             self._tick_pedestrian(stamp)
         elif self.phase == "SHORTCUT":
             self._tick_shortcut(stamp)
+        elif self.phase == "OVERTAKE":
+            self._tick_overtake(stamp)
 
         # 로그
         self._log_counter += 1
@@ -627,26 +702,37 @@ class PathPlannerNode(Node):
         return diff <= STOP_HEADING_TOL
 
     def _check_red_stop(self, stamp):
-        """정지선 가까이 + GREEN 아님 → 정지. GREEN 뜨면 해제. True 반환 시 이번 틱 종료."""
+        """정지선 가까이 + GREEN 아님 → 정지. GREEN 뜰 때만 해제. True 반환 시 이번 틱 종료."""
+        police_recent = self._police_seen_ago <= 10  # 0.5초 이내 POLICE
+        # 이미 정지 중이면 GREEN + POLICE 최근으로 해제
+        if self._red_stopping:
+            if GREEN_CLS_ID in self._events and police_recent:
+                self._pub_estop.publish(Bool(data=False))
+                self.get_logger().info("GREEN + POLICE recent → GO")
+                self._red_stopping = False
+                return False
+            if GREEN_CLS_ID in self._events and not police_recent:
+                # GREEN + POLICE 아님 → 바로 SHORTCUT.WAITING 진입
+                self._red_stopping = False
+                self.phase = "SHORTCUT"
+                self._sc_sub = "WAITING"
+                self._sc_tick = 0
+                self._left_signal_hits = 0
+                self._pub_estop.publish(Bool(data=True))
+                self.get_logger().info("GREEN + no POLICE → SHORTCUT.WAITING (LEFT 대기)")
+                return True
+            self._pub_estop.publish(Bool(data=True))
+            self._tick_lane(stamp)
+            return True
+        # 새로 진입: 정지선 + heading OK + GREEN 없음
         if (self._stop_max_v is None or self._stop_max_v < STOP_V_THRESHOLD
                 or not self._heading_ok_for_stop()):
-            if self._red_stopping:
-                self._pub_estop.publish(Bool(data=False))
-                self.get_logger().info("stopline gone → GO")
-                self._red_stopping = False
             return False
-        # 정지선 가까이 + heading OK
-        if GREEN_CLS_ID in self._events:
-            if self._red_stopping:
-                self._pub_estop.publish(Bool(data=False))
-                self.get_logger().info("GREEN at stopline → GO")
-                self._red_stopping = False
-            return False
-        # GREEN 없음 → 정지
-        if not self._red_stopping:
-            self.get_logger().info(
-                f"stopline (v={self._stop_max_v:.0f}) no GREEN → STOP")
-            self._red_stopping = True
+        if GREEN_CLS_ID in self._events and police_recent:
+            return False  # POLICE 교차로 + 초록불 → 그냥 통과
+        self.get_logger().info(
+            f"stopline (v={self._stop_max_v:.0f}) no GREEN → STOP")
+        self._red_stopping = True
         self._pub_estop.publish(Bool(data=True))
         self._tick_lane(stamp)
         return True
@@ -799,6 +885,200 @@ class PathPlannerNode(Node):
         self._pub_left.publish(_poses_from_xy(stamp, xs, ys + 1.0))
         self._pub_right.publish(_poses_from_xy(stamp, xs, ys - 1.0))
         self._publish_target(stamp, float(xs[-1]), float(ys[-1]))
+
+    # ---- OVERTAKE: 추월 ----
+
+    def _check_overtake(self):
+        """LANE 주행 중 전방 차량 감지 → OVERTAKE 진입."""
+        if self._ot_cooldown > 0:
+            self._ot_cooldown -= 1
+            return
+        if self._car_max_v is None or self._car_max_v < OT_CAR_V_THRESHOLD:
+            return
+        if not (OT_HEADING_MIN <= self._heading_deg <= OT_HEADING_MAX):
+            return
+        if POLICE_CLS_ID in self._events:
+            return
+        self.phase = "OVERTAKE"
+        self._ot_sub = "LANE_TO_2ND"
+        self._ot_tick = 0
+        self._ot_right_fit = None
+        self._ot_yellow_fit = None
+        self.get_logger().info(
+            f"CAR detected (v={self._car_max_v:.0f}) → OVERTAKE.LANE_TO_2ND")
+
+    def _tick_overtake(self, stamp):
+        """OVERTAKE sub-state dispatch."""
+        self._ot_update_fits()
+        if self._ot_sub == "LANE_TO_2ND":
+            self._tick_ot_lane_to_2nd(stamp)
+        elif self._ot_sub == "PASSING":
+            self._tick_ot_passing(stamp)
+        elif self._ot_sub == "CAR_BESIDE":
+            self._tick_ot_car_beside(stamp)
+        elif self._ot_sub == "RETURN_TO_1ST":
+            self._tick_ot_return(stamp)
+        elif self._ot_sub == "MERGE":
+            self._tick_ot_merge(stamp)
+        else:
+            self.get_logger().warn(f"Unknown ot_sub={self._ot_sub} → LANE")
+            self._exit_overtake()
+
+    def _tick_ot_lane_to_2nd(self, stamp):
+        """노란선 기준 오른쪽 1.5m로 2차선 이동 (3초)."""
+        self._ot_tick += 1
+        if self._ot_yellow_fit is not None:
+            self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_RIGHT_OFFSET)
+        if self._ot_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[OT] LANE_TO_2ND tick={self._ot_tick}/{OT_LANE_TO_2ND_TICKS}")
+        if self._ot_tick >= OT_LANE_TO_2ND_TICKS:
+            self._ot_sub = "PASSING"
+            self._ot_tick = 0
+            self.get_logger().info("OVERTAKE → PASSING (2차선 주행)")
+
+    def _tick_ot_passing(self, stamp):
+        """오른쪽 흰 실선 +1.5m로 2차선 주행. 왼쪽 라이다 감지 대기."""
+        self._ot_tick += 1
+        if self._ot_right_fit is not None:
+            self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_OFFSET)
+        if self._ot_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[OT] PASSING tick={self._ot_tick} left_det={self._left_side_detected}")
+        if self._left_side_detected:
+            self._ot_sub = "CAR_BESIDE"
+            self._ot_tick = 0
+            self.get_logger().info("OVERTAKE → CAR_BESIDE (왼쪽 감지, 흰선 왼쪽 5.5m)")
+
+    def _tick_ot_car_beside(self, stamp):
+        """왼쪽 감지 중 흰선 왼쪽 5.5m로 주행. 사라지면 RETURN."""
+        self._ot_tick += 1
+        if self._ot_right_fit is not None:
+            self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_PASSING)
+        if self._ot_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[OT] CAR_BESIDE tick={self._ot_tick} left_det={self._left_side_detected}")
+        if not self._left_side_detected:
+            self._ot_sub = "RETURN_TO_1ST"
+            self._ot_tick = 0
+            self.get_logger().info("OVERTAKE → RETURN_TO_1ST (왼쪽 사라짐, 노란 왼쪽 2.0m)")
+
+    def _tick_ot_car_passed(self, stamp):
+        """차 지나간 후 2초 대기 (아직 2차선 유지)."""
+        self._ot_tick += 1
+        if self._ot_right_fit is not None:
+            self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_OFFSET)
+        else:
+            self._tick_lane(stamp)
+        if self._ot_tick >= OT_CAR_PASSED_DELAY_TICKS:
+            self._ot_sub = "RETURN_TO_1ST"
+            self._ot_tick = 0
+            self.get_logger().info("OVERTAKE → RETURN_TO_1ST (1차선 복귀)")
+
+    def _tick_ot_return(self, stamp):
+        """노란선 기준 왼쪽 2.3m로 5초 → MERGE."""
+        self._ot_tick += 1
+        if self._ot_yellow_fit is not None:
+            self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_LEFT_OFFSET_1)
+        if self._ot_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[OT] RETURN tick={self._ot_tick}/{OT_RETURN_TICKS}")
+        if self._ot_tick >= OT_RETURN_TICKS:
+            self._ot_sub = "MERGE"
+            self._ot_tick = 0
+            self.get_logger().info("RETURN done → MERGE (노란 오른쪽 0.5m)")
+            return
+
+    def _tick_ot_merge(self, stamp):
+        """노란선 기준 오른쪽 0.5m로 합류 주행 후 LANE 복귀."""
+        self._ot_tick += 1
+        if self._ot_yellow_fit is not None:
+            self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_RIGHT_MERGE)
+        if self._ot_tick % PLAN_HZ == 0:
+            self.get_logger().info(
+                f"[OT] MERGE tick={self._ot_tick}/{OT_MERGE_TICKS}")
+        if self._ot_tick >= OT_MERGE_TICKS:
+            self.get_logger().info("MERGE done → LANE")
+            self._exit_overtake()
+
+    def _exit_overtake(self):
+        self.phase = "LANE"
+        self._ot_sub = None
+        self._ot_tick = 0
+        self._ot_cooldown = OT_COOLDOWN_TICKS
+        self._ot_right_fit = None
+        self._ot_yellow_fit = None
+        self._pub_slow_merge.publish(Bool(data=False))
+
+    def _ot_update_fits(self):
+        """추월 중 흰선/노란선 피팅 업데이트."""
+        # 오른쪽 흰 실선
+        if self._white_xs.size >= 3:
+            rx, ry = self._ot_extract_right(self._white_xs, self._white_ys)
+            new_fit = self._ot_fit(rx, ry, self._ot_right_fit)
+            if new_fit is not None:
+                if self._ot_right_fit is not None:
+                    self._ot_right_fit = ((1.0 - OT_EMA_ALPHA) * self._ot_right_fit
+                                          + OT_EMA_ALPHA * new_fit)
+                else:
+                    self._ot_right_fit = new_fit
+        # 노란선
+        if self._yellow_xs.size >= OT_FIT_MIN_POINTS:
+            new_fit = self._ot_fit(self._yellow_xs, self._yellow_ys, self._ot_yellow_fit)
+            if new_fit is not None:
+                if self._ot_yellow_fit is not None:
+                    self._ot_yellow_fit = ((1.0 - OT_EMA_ALPHA) * self._ot_yellow_fit
+                                           + OT_EMA_ALPHA * new_fit)
+                else:
+                    self._ot_yellow_fit = new_fit
+
+    @staticmethod
+    def _ot_extract_right(xs, ys):
+        """x 구간별 최소 Y → 오른쪽 실선."""
+        bins = np.arange(0.5, 8.0, OT_X_BIN_SIZE)
+        rx, ry = [], []
+        for bx in bins:
+            mask = (xs >= bx) & (xs < bx + OT_X_BIN_SIZE)
+            if not mask.any():
+                continue
+            idx = np.argmin(ys[mask])
+            rx.append(float(xs[mask][idx]))
+            ry.append(float(ys[mask][idx]))
+        return np.array(rx), np.array(ry)
+
+    @staticmethod
+    def _ot_fit(xs, ys, prev_fit):
+        """아웃라이어 제거 + 2차 피팅."""
+        if prev_fit is not None and xs.size >= 3:
+            expected = np.polyval(prev_fit, xs)
+            inlier = np.abs(ys - expected) < OT_OUTLIER_THR
+            if inlier.sum() >= OT_FIT_MIN_POINTS:
+                xs, ys = xs[inlier], ys[inlier]
+        if xs.size < OT_FIT_MIN_POINTS:
+            return None
+        x_span = float(xs.max() - xs.min())
+        if x_span < 1.0:
+            return None
+        try:
+            deg = 2 if xs.size >= 6 and x_span >= 2.0 else 1
+            coef = np.polyfit(xs, ys, deg)
+            if deg == 1:
+                coef = np.array([0.0, coef[0], coef[1]])
+            return coef
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+
+    def _ot_publish_path(self, stamp, fit, offset):
+        """피팅 + 오프셋으로 center_path 발행."""
+        center_coef = fit.copy()
+        center_coef[2] += offset
+        sample_xs = np.linspace(0.5, 8.0, 20)
+        center_ys = np.clip(np.polyval(center_coef, sample_xs),
+                            -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+        self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
+        target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
+                                 -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
+        self._publish_target(stamp, TARGET_X, target_y)
 
     # ---- LANE (친구 plan() 그대로) ----
 

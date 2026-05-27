@@ -97,7 +97,9 @@ def _extract_colored_lane_masks(bev_img):
     hsv = cv2.cvtColor(bev_img, cv2.COLOR_RGB2HSV)
     H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     valid = V > 5
-    white = ((V >= LANE_WHITE_V_MIN) & (S <= LANE_WHITE_S_MAX) & valid)
+    white = ((V >= LANE_WHITE_V_MIN) & (S <= LANE_WHITE_S_MAX)
+             & ~((H >= LANE_YELLOW_H_MIN) & (H <= LANE_YELLOW_H_MAX))
+             & valid)
     yellow = ((H >= LANE_YELLOW_H_MIN) & (H <= LANE_YELLOW_H_MAX)
               & (S >= LANE_YELLOW_S_MIN) & (V >= LANE_YELLOW_V_MIN)
               & valid)

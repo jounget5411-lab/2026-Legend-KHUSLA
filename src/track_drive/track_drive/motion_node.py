@@ -60,6 +60,7 @@ LEFT_TURN2_TICKS = 50             # TURNING_2 지속 (50 ticks = 2.5초)
 CHILD_ZONE_SPEED = 6.0            # 어린이 보호구역 속도 제한
 SLOW_AFTER_TURN_SPEED = 5.0       # 좌회전 직후 감속
 SLOW_AFTER_TURN_TICKS = 60        # 3초 (20Hz)
+SLOW_MERGE_SPEED = 7.0            # 추월 합류 시 속도 제한
 # 응답 빠르게 하려고 alpha up (한 프레임에 변화의 75% 반영).
 ANGLE_SMOOTH_ALPHA = 0.55
 ANGLE_MAX_STEP = 12.0
@@ -129,6 +130,7 @@ class MotionNode(Node):
         self._left_turn_ticks = 0
         self._child_zone = False
         self._slow_after_turn = 0
+        self._slow_merge = False
 
         self.create_subscription(PoseArray, "/center_path", self._on_path, 10)
         self.create_subscription(PointStamped, "/target", self._on_target, 10)
@@ -137,6 +139,7 @@ class MotionNode(Node):
         self.create_subscription(Bool, "/left_turn2", self._on_left_turn2, 10)
         self.create_subscription(Bool, "/child_zone", self._on_child_zone, 10)
         self.create_subscription(Bool, "/slow_after_turn", self._on_slow_turn, 10)
+        self.create_subscription(Bool, "/slow_merge", self._on_slow_merge, 10)
         self._pub = self.create_publisher(XycarMotor, "/xycar_motor", 10)
         self.create_timer(1.0 / CONTROL_HZ, self._tick)
 
@@ -168,6 +171,13 @@ class MotionNode(Node):
             self._slow_after_turn = SLOW_AFTER_TURN_TICKS
             self.get_logger().info(
                 f"SLOW after turn: speed={SLOW_AFTER_TURN_SPEED} for {SLOW_AFTER_TURN_TICKS} ticks")
+
+    def _on_slow_merge(self, msg: Bool):
+        if msg.data != self._slow_merge:
+            self.get_logger().info(
+                f"SLOW_MERGE {'ON' if msg.data else 'OFF'} → speed cap "
+                f"{'%.1f' % SLOW_MERGE_SPEED if msg.data else 'normal'}")
+        self._slow_merge = msg.data
 
     def _on_child_zone(self, msg: Bool):
         if msg.data != self._child_zone:
@@ -512,6 +522,8 @@ class MotionNode(Node):
             self._slow_after_turn -= 1
             if speed > SLOW_AFTER_TURN_SPEED:
                 speed = SLOW_AFTER_TURN_SPEED
+        if self._slow_merge and speed > SLOW_MERGE_SPEED:
+            speed = SLOW_MERGE_SPEED
         if self._child_zone and speed > CHILD_ZONE_SPEED:
             speed = CHILD_ZONE_SPEED
         msg = XycarMotor()

@@ -60,8 +60,8 @@ H_PIX2LIDAR_FALLBACK = np.array([
 # 차선 마스크 파라미터
 # ============================================================
 
-LANE_WHITE_V_MIN  = 200
-LANE_WHITE_S_MAX  = 50
+LANE_WHITE_V_MIN  = 255
+LANE_WHITE_S_MAX  = 0
 LANE_YELLOW_H_MIN = 18
 LANE_YELLOW_H_MAX = 38
 LANE_YELLOW_S_MIN = 80
@@ -220,7 +220,8 @@ def extract_lane_mask(bev_img):
         return None
     hsv = cv2.cvtColor(bev_img, cv2.COLOR_RGB2HSV)
     H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    white = (V >= LANE_WHITE_V_MIN) & (S <= LANE_WHITE_S_MAX)
+    white = ((V >= LANE_WHITE_V_MIN) & (S <= LANE_WHITE_S_MAX)
+             & ~((H >= LANE_YELLOW_H_MIN) & (H <= LANE_YELLOW_H_MAX)))
     yellow = ((H >= LANE_YELLOW_H_MIN) & (H <= LANE_YELLOW_H_MAX)
               & (S >= LANE_YELLOW_S_MIN) & (V >= LANE_YELLOW_V_MIN))
     valid = V > 5
