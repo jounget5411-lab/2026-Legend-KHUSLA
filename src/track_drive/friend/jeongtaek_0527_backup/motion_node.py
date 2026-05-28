@@ -61,8 +61,6 @@ CHILD_ZONE_SPEED = 6.0            # 어린이 보호구역 속도 제한
 SLOW_AFTER_TURN_SPEED = 5.0       # 좌회전 직후 감속
 SLOW_AFTER_TURN_TICKS = 60        # 3초 (20Hz)
 SLOW_MERGE_SPEED = 7.0            # 추월 합류 시 속도 제한
-CONE_SPEED_FIXED = 12.0           # 라바콘 구간 고정 속도
-CONE_STEER_GAIN = 1.12            # 라바콘 구간 조향 보정
 # 응답 빠르게 하려고 alpha up (한 프레임에 변화의 75% 반영).
 ANGLE_SMOOTH_ALPHA = 0.55
 ANGLE_MAX_STEP = 12.0
@@ -115,7 +113,7 @@ REANCHOR_FAR_M = 0.65
 
 class MotionNode(Node):
     def __init__(self):
-        super().__init__("track_drive")
+        super().__init__("motion_node")
 
         self._path_xs = None
         self._path_ys = None
@@ -133,7 +131,6 @@ class MotionNode(Node):
         self._child_zone = False
         self._slow_after_turn = 0
         self._slow_merge = False
-        self._cone_mode = False
 
         self.create_subscription(PoseArray, "/center_path", self._on_path, 10)
         self.create_subscription(PointStamped, "/target", self._on_target, 10)
@@ -143,11 +140,10 @@ class MotionNode(Node):
         self.create_subscription(Bool, "/child_zone", self._on_child_zone, 10)
         self.create_subscription(Bool, "/slow_after_turn", self._on_slow_turn, 10)
         self.create_subscription(Bool, "/slow_merge", self._on_slow_merge, 10)
-        self.create_subscription(Bool, "/cone_mode", self._on_cone_mode, 10)
         self._pub = self.create_publisher(XycarMotor, "/xycar_motor", 10)
         self.create_timer(1.0 / CONTROL_HZ, self._tick)
 
-        self.get_logger().info("TRACK")
+        self.get_logger().info("motion_node started (centerline-pursuit)")
 
     def _on_path(self, msg: PoseArray):
         if not msg.poses:
@@ -170,35 +166,39 @@ class MotionNode(Node):
     def _on_estop(self, msg: Bool):
         self._e_stop = msg.data
 
-    def _on_cone_mode(self, msg: Bool):
-        self._cone_mode = bool(msg.data)
-
     def _on_slow_turn(self, msg: Bool):
         if msg.data:
             self._slow_after_turn = SLOW_AFTER_TURN_TICKS
-            self.get_logger().info("SLOW")
+            self.get_logger().info(
+                f"SLOW after turn: speed={SLOW_AFTER_TURN_SPEED} for {SLOW_AFTER_TURN_TICKS} ticks")
 
     def _on_slow_merge(self, msg: Bool):
         if msg.data != self._slow_merge:
-            self.get_logger().info("MERGE ON" if msg.data else "MERGE OFF")
+            self.get_logger().info(
+                f"SLOW_MERGE {'ON' if msg.data else 'OFF'} → speed cap "
+                f"{'%.1f' % SLOW_MERGE_SPEED if msg.data else 'normal'}")
         self._slow_merge = msg.data
 
     def _on_child_zone(self, msg: Bool):
         if msg.data != self._child_zone:
-            self.get_logger().info("CHILD ON" if msg.data else "CHILD OFF")
+            self.get_logger().info(
+                f"CHILD_ZONE {'ON' if msg.data else 'OFF'} → speed cap "
+                f"{'%.1f' % CHILD_ZONE_SPEED if msg.data else 'normal'}")
         self._child_zone = msg.data
 
     def _on_left_turn1(self, msg: Bool):
         if msg.data and not self._left_turn:
             self._left_turn = True
             self._left_turn_ticks = LEFT_TURN1_TICKS
-            self.get_logger().info("LT1")
+            self.get_logger().info(
+                f"LEFT_TURN1 start: ticks={LEFT_TURN1_TICKS}")
 
     def _on_left_turn2(self, msg: Bool):
         if msg.data and not self._left_turn:
             self._left_turn = True
             self._left_turn_ticks = LEFT_TURN2_TICKS
-            self.get_logger().info("LT2")
+            self.get_logger().info(
+                f"LEFT_TURN2 start: ticks={LEFT_TURN2_TICKS}")
 
     def _tick(self):
         if self._e_stop:
@@ -210,7 +210,7 @@ class MotionNode(Node):
             self._left_turn_ticks -= 1
             if self._left_turn_ticks <= 0:
                 self._left_turn = False
-                self.get_logger().info("LT END")
+                self.get_logger().info("LEFT_TURN done")
             return
 
         now = self.get_clock().now()
@@ -280,14 +280,10 @@ class MotionNode(Node):
 
         angle = self._compute_steering(
             seg_xs, seg_ys, seg_s, steer_ratio, self._straight_boost_level)
-        if self._cone_mode:
-            angle = float(np.clip(angle * CONE_STEER_GAIN, ANGLE_MIN, ANGLE_MAX))
         angle = self._apply_corner_exit_unwind(angle)
         angle = self._smooth_angle(angle)
         self._prev_steer_ratio = near_steer_ratio
         speed = self._speed_from_angle(angle, seg_xs, seg_ys, preview_ratio, in_corner)
-        if self._cone_mode:
-            speed = CONE_SPEED_FIXED
         self._publish_motor(speed, angle)
 
     @staticmethod
@@ -328,8 +324,7 @@ class MotionNode(Node):
             mask = rel_s >= 0.0
         return xs[mask], ys[mask], rel_s[mask]
 
-    def _compute_steering(self, xs, ys, rel_s, steer_ratio,
-                          straight_boost_level=0.0):
+    def _compute_steering(self, xs, ys, rel_s, steer_ratio, straight_boost_level=0.0):
         if xs.size < 2:
             return 0.0
 
@@ -342,7 +337,8 @@ class MotionNode(Node):
             slopes = np.zeros_like(xs)
         heading_angles = np.degrees(np.arctan(-slopes))
 
-        if steer_ratio >= STEER_CURVE_SWITCH_RATIO:
+        use_curve_gain = steer_ratio >= STEER_CURVE_SWITCH_RATIO
+        if use_curve_gain:
             pursuit_gain = CURVE_PURSUIT_GAIN
             heading_gain = CURVE_HEADING_GAIN
         else:

@@ -66,7 +66,7 @@ class YoloDetectNode(Node):
         self.declare_parameter("model_path", DEFAULT_MODEL_PATH)
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("imgsz", 640)
-        self.declare_parameter("device", "cuda")
+        self.declare_parameter("device", "cpu")
 
         model_path = str(self.get_parameter("model_path").value)
         self._conf = float(self.get_parameter("conf").value)
@@ -74,12 +74,12 @@ class YoloDetectNode(Node):
         self._device = str(self.get_parameter("device").value)
 
         if not os.path.exists(model_path):
-            self.get_logger().error("NO MODEL")
+            self.get_logger().error(f"Model not found: {model_path}")
             raise FileNotFoundError(model_path)
 
-        self.get_logger().info("YOLO LOAD")
+        self.get_logger().info(f"Loading YOLO: {model_path}")
         self._model = YOLO(model_path)
-        self.get_logger().info("YOLO CLS")
+        self.get_logger().info(f"Classes: {self._model.names}")
 
         self.create_subscription(
             Image, "/usb_cam/image_raw/front",
@@ -88,7 +88,7 @@ class YoloDetectNode(Node):
         self._pub_road = self.create_publisher(PoseArray, "/detect/road_pixels", 10)
         self._pub_events = self.create_publisher(PoseArray, "/detect/events_raw", 10)
 
-        self.get_logger().info("YOLO")
+        self.get_logger().info("yolo_detect_node started (detect mode)")
 
     def _on_image(self, msg: Image):
         if msg.encoding != "rgb8":

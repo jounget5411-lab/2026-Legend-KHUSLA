@@ -84,7 +84,7 @@ class IntegrationNode(Node):
         self._pub_lane_quality = self.create_publisher(Float32, "/fused/lane_quality", 10)
         self._pub_obs = self.create_publisher(PoseArray, "/fused/obstacles", 10)
 
-        self.get_logger().info("INTEG")
+        self.get_logger().info("integration_node started (with quality passthrough)")
 
     def _on_lane(self, msg: PoseArray):
         self._latest_lane = msg

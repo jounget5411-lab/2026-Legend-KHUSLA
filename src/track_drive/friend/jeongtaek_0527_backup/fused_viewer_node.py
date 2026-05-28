@@ -192,7 +192,7 @@ class ViewerSubscriber(Node):
         self._H_built = False
         self.create_timer(0.5, self._maybe_build_homography)
 
-        self.get_logger().info("VIEWER")
+        self.get_logger().info("kookmin9_viewer 시작.")
 
     def _on_image(self, slot, msg):
         if msg.encoding != "rgb8":
@@ -293,7 +293,7 @@ class ViewerSubscriber(Node):
 
         cam_ground_height = float(t[2] - GROUND_Z_IN_LIDAR)
         if abs(cam_ground_height) < 1e-3:
-            self.get_logger().warn("BEV Z")
+            self.get_logger().warn("카메라 z≈ground. BEV 비활성.")
             return
         plane_scale = GROUND_Z_IN_LIDAR - float(t[2])
         T_homog = np.array([
@@ -318,13 +318,16 @@ class ViewerSubscriber(Node):
             X_chk = p[0] / p[2]
             Y_chk = p[1] / p[2]
             score = X_chk - 2.0 * abs(Y_chk)
-            self.get_logger().info("BEV TRY")
+            self.get_logger().info(
+                f"BEV 시도 [{label}]: 중앙-하단 → "
+                f"(X={X_chk:+.2f}, Y={Y_chk:+.2f}) m   score={score:+.2f}"
+            )
             if 0.5 < X_chk < 20 and abs(Y_chk) < 2.0:
                 if best is None or score > best[0]:
                     best = (score, label, H_pl, X_chk, Y_chk)
 
         if best is None:
-            self.get_logger().warn("BEV ERR")
+            self.get_logger().warn("어떤 컨벤션도 합리적 BEV를 만들지 못함.")
             return
 
         _, label, H_pix2lidar, X_chk, Y_chk = best
@@ -335,7 +338,9 @@ class ViewerSubscriber(Node):
             self.state.cam_height_m = cam_ground_height
             self.state.convention = label
         self._H_built = True
-        self.get_logger().info("BEV OK")
+        self.get_logger().info(
+            f"BEV 호모그래피 빌드 완료 [{label}]. cam_h={cam_ground_height:+.3f} m"
+        )
 
 
 def extract_lane_mask(bev_img):

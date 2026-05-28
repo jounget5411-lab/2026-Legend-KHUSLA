@@ -39,7 +39,6 @@ from geometry_msgs.msg import Pose, PoseArray, PointStamped
 # YOLO 클래스 → 차선 색상 매핑. CHILD_LANE은 학교영역 노면 표시여서 외곽 흰선
 # 역할로 묶는다. integration_node가 position.z에 cls_id를 채워 보낸다.
 YELLOW_CLS_IDS = {8}            # MID = 노랑 중앙선
-YELLOW_DASH_CLS_IDS = {16}      # 어린이 보호구역용 노란 점선 조각
 WHITE_CLS_IDS = {6, 2}          # LANE = 흰 외곽선, CHILD_LANE = 학교영역 마킹
 
 PLAN_HZ = 20
@@ -76,17 +75,6 @@ YELLOW_FIT_SMOOTH_ALPHA = 0.28
 YELLOW_DIRECTION_OUTLIER_BAND_M = 0.70
 YELLOW_DIRECTION_FILTER_MIN_POINTS = FIT_MIN_POINTS
 YELLOW_DIRECTION_SELECT_BIN_M = 0.45
-CHILD_DASH_MIN_POINTS = 8
-CHILD_DASH_MIN_X_SPAN = 1.15
-CHILD_DASH_BAND_M = 0.38
-CHILD_DASH_BIN_M = 0.35
-CHILD_DASH_MIN_BINS = 4
-CHILD_DASH_MIN_GAP_M = 0.65
-CHILD_DASH_MAX_OCCUPANCY = 0.82
-CHILD_DASH_MAX_RMSE = 0.40
-CHILD_DASH_MAX_MISS = 8
-CHILD_DASH_MAX_JUMP_M = 0.85
-CHILD_DASH_SMOOTH_ALPHA = 0.35
 
 MIN_LANE_WIDTH = 2.40
 MAX_LANE_WIDTH = 3.60
@@ -132,8 +120,6 @@ _prev_lane_plan = None
 _lane_memory_frames = 0
 _prev_lane_side = None
 _yellow_miss = 0
-_prev_child_yellow_dash_fit = None
-_child_yellow_dash_miss = 0
 
 # YOLO seg 출력은 노이즈가 적어서 RANSAC 없이 단순 polyfit으로 충분.
 # 실제 fit에 들어간 점들을 캐싱해 /fit/yellow_inliers로 노출 (디버그용).
@@ -805,183 +791,6 @@ def _choose_nearest_lane_plan(candidates):
     return best_plan
 
 
-def _child_dash_stats(xs):
-    if xs.size < CHILD_DASH_MIN_POINTS:
-        return None
-    order = np.sort(np.asarray(xs, dtype=np.float64))
-    x_span = float(order[-1] - order[0])
-    if x_span < CHILD_DASH_MIN_X_SPAN:
-        return None
-
-    bin_ids = np.unique(
-        np.floor((order - FIT_X_MIN) / CHILD_DASH_BIN_M).astype(np.int32))
-    if bin_ids.size < CHILD_DASH_MIN_BINS:
-        return None
-    bin_span = max(1, int(bin_ids[-1] - bin_ids[0] + 1))
-    occupancy = float(bin_ids.size / bin_span)
-
-    x_gap = float(np.max(np.diff(order))) if order.size >= 2 else 0.0
-    if bin_ids.size >= 2:
-        bin_gap = float(np.max(np.diff(bin_ids) - 1) * CHILD_DASH_BIN_M)
-    else:
-        bin_gap = 0.0
-    max_gap = max(x_gap, bin_gap)
-    dash_like = (
-        max_gap >= CHILD_DASH_MIN_GAP_M
-        or occupancy <= CHILD_DASH_MAX_OCCUPANCY
-    )
-    return {
-        "x_span": x_span,
-        "occupancy": occupancy,
-        "max_gap": max_gap,
-        "dash_like": dash_like,
-    }
-
-
-def _fit_child_dash_candidate(xs, ys):
-    if xs.size < CHILD_DASH_MIN_POINTS:
-        return None
-    x_span = float(np.max(xs) - np.min(xs))
-    if x_span < CHILD_DASH_MIN_X_SPAN:
-        return None
-    try:
-        w = 1.0 / (1.0 + xs * xs)
-        coef = np.polyfit(xs, ys, 2, w=w)
-    except (np.linalg.LinAlgError, ValueError):
-        return None
-    if not np.all(np.isfinite(coef)):
-        return None
-    a, b, _ = coef
-    if abs(a) > FIT_CURVE_MAX or abs(b) > FIT_SLOPE_MAX:
-        return None
-
-    err = np.abs(ys - np.polyval(coef, xs))
-    inliers = err <= CHILD_DASH_BAND_M
-    if int(np.count_nonzero(inliers)) >= CHILD_DASH_MIN_POINTS:
-        try:
-            w = 1.0 / (1.0 + xs[inliers] * xs[inliers])
-            refined = np.polyfit(xs[inliers], ys[inliers], 2, w=w)
-        except (np.linalg.LinAlgError, ValueError):
-            refined = None
-        if refined is not None and np.all(np.isfinite(refined)):
-            a, b, _ = refined
-            if abs(a) <= FIT_CURVE_MAX and abs(b) <= FIT_SLOPE_MAX:
-                coef = refined
-                err = np.abs(ys - np.polyval(coef, xs))
-                inliers = err <= CHILD_DASH_BAND_M
-
-    if int(np.count_nonzero(inliers)) < CHILD_DASH_MIN_POINTS:
-        return None
-    rmse = float(np.sqrt(np.mean(err[inliers] * err[inliers])))
-    if rmse > CHILD_DASH_MAX_RMSE:
-        return None
-    return coef, rmse
-
-
-def _child_dash_seed_values(xs, ys):
-    seeds = []
-    if _prev_child_yellow_dash_fit is not None:
-        seeds.append(float(np.polyval(_prev_child_yellow_dash_fit, TARGET_X)))
-
-    band = ((xs >= max(FIT_X_MIN, TARGET_X - 2.5))
-            & (xs <= min(FIT_X_MAX, TARGET_X + 3.5)))
-    y_ref = ys[band] if int(np.count_nonzero(band)) >= CHILD_DASH_MIN_POINTS else ys
-    if y_ref.size >= CHILD_DASH_MIN_POINTS:
-        y_sorted = np.sort(y_ref)
-        splits = np.where(np.diff(y_sorted) > 0.45)[0] + 1
-        for group in np.split(y_sorted, splits):
-            if group.size >= CHILD_DASH_MIN_POINTS:
-                seeds.append(float(np.median(group)))
-
-    seeds.extend(_window_seed_values(xs, ys))
-    return list(dict.fromkeys(round(float(s), 3) for s in seeds))
-
-
-def _child_dash_jump_ok(prev, new):
-    if prev is None or new is None:
-        return True
-    check_xs = np.array([1.8, TARGET_X, 7.5], dtype=np.float64)
-    jump = np.max(np.abs(np.polyval(new, check_xs) - np.polyval(prev, check_xs)))
-    return bool(jump <= CHILD_DASH_MAX_JUMP_M)
-
-
-def _fit_yellow_child_dash(xs, ys):
-    """어린이 보호구역에서는 연속 실선보다 x 방향으로 끊긴 노란 점선을 우선한다."""
-    global _prev_child_yellow_dash_fit, _child_yellow_dash_miss
-    global _yellow_inlier_xs, _yellow_inlier_ys
-
-    xs = np.asarray(xs, dtype=np.float64)
-    ys = np.asarray(ys, dtype=np.float64)
-    roi = (
-        (xs > FIT_X_MIN) &
-        (xs < FIT_X_MAX) &
-        (np.abs(ys) < FIT_Y_ABS_MAX)
-    )
-    xs = xs[roi]
-    ys = ys[roi]
-    if xs.size < CHILD_DASH_MIN_POINTS:
-        _child_yellow_dash_miss += 1
-        if (_prev_child_yellow_dash_fit is not None
-                and _child_yellow_dash_miss <= CHILD_DASH_MAX_MISS):
-            return _prev_child_yellow_dash_fit
-        return None
-
-    candidates = []
-    seeds = _child_dash_seed_values(xs, ys)
-    if not seeds:
-        seeds = [float(np.median(ys))]
-
-    for seed in seeds:
-        mask = np.abs(ys - seed) <= max(FIT_BAND_WIDTH, CHILD_DASH_BAND_M)
-        cand = _fit_child_dash_candidate(xs[mask], ys[mask])
-        if cand is None:
-            continue
-        coef, rmse = cand
-        if not _child_dash_jump_ok(_prev_child_yellow_dash_fit, coef):
-            continue
-        inlier = np.abs(ys - np.polyval(coef, xs)) <= CHILD_DASH_BAND_M
-        stats = _child_dash_stats(xs[inlier])
-        if stats is None or not stats["dash_like"]:
-            continue
-        prev_penalty = 0.0
-        if _prev_child_yellow_dash_fit is not None:
-            prev_penalty = 0.18 * abs(
-                float(np.polyval(coef, TARGET_X))
-                - float(np.polyval(_prev_child_yellow_dash_fit, TARGET_X))
-            )
-        score = (
-            rmse
-            - 0.035 * stats["x_span"]
-            - 0.45 * stats["max_gap"]
-            - 0.55 * (1.0 - stats["occupancy"])
-            + prev_penalty
-        )
-        candidates.append((score, coef, inlier))
-
-    if not candidates:
-        _child_yellow_dash_miss += 1
-        if (_prev_child_yellow_dash_fit is not None
-                and _child_yellow_dash_miss <= CHILD_DASH_MAX_MISS):
-            return _prev_child_yellow_dash_fit
-        return None
-
-    candidates.sort(key=lambda item: item[0])
-    fit = np.asarray(candidates[0][1], dtype=np.float64)
-    inlier = candidates[0][2]
-
-    if _prev_child_yellow_dash_fit is None:
-        _prev_child_yellow_dash_fit = fit
-    else:
-        _prev_child_yellow_dash_fit = (
-            (1.0 - CHILD_DASH_SMOOTH_ALPHA) * _prev_child_yellow_dash_fit
-            + CHILD_DASH_SMOOTH_ALPHA * fit
-        )
-    _child_yellow_dash_miss = 0
-    _yellow_inlier_xs = xs[inlier]
-    _yellow_inlier_ys = ys[inlier]
-    return _prev_child_yellow_dash_fit
-
-
 def _choose_lane_plan_from_yellow(yellow_coef, white_xs, white_ys):
     candidates = []
 
@@ -1115,7 +924,8 @@ class PathPlannerNode(Node):
             PoseArray, "/fit/yellow_inliers", 10)
         self.create_timer(1.0 / PLAN_HZ, self._tick)
 
-        self.get_logger().info("LANEPLAN")
+        self.get_logger().info(
+            f"path_planner_node started (color-aware, PREFERRED_LANE={PREFERRED_LANE})")
 
     def _on_lane(self, msg: PoseArray):
         self._has_lane = True
@@ -1202,8 +1012,7 @@ class PathPlannerNode(Node):
 
 # ======================== 경로계획 ========================
 
-def plan(yellow_xs, yellow_ys, white_xs, white_ys, obstacles,
-         child_zone=False, yellow_dash_xs=None, yellow_dash_ys=None):
+def plan(yellow_xs, yellow_ys, white_xs, white_ys, obstacles):
     """노랑(MID) 2차식 자체를 center로 사용 — 노란 중앙선을 직접 따라간다.
 
     흰선 점은 안 쓴다 (signature는 호환 위해 유지).
@@ -1211,18 +1020,7 @@ def plan(yellow_xs, yellow_ys, white_xs, white_ys, obstacles,
     yellow_xs = np.asarray(yellow_xs, dtype=np.float64)
     yellow_ys = np.asarray(yellow_ys, dtype=np.float64)
 
-    if child_zone:
-        dash_xs = np.asarray(
-            yellow_dash_xs if yellow_dash_xs is not None else yellow_xs,
-            dtype=np.float64)
-        dash_ys = np.asarray(
-            yellow_dash_ys if yellow_dash_ys is not None else yellow_ys,
-            dtype=np.float64)
-        yellow_fit = _fit_yellow_child_dash(dash_xs, dash_ys)
-        if yellow_fit is None:
-            yellow_fit = _fit_yellow_sliding(yellow_xs, yellow_ys)
-    else:
-        yellow_fit = _fit_yellow_sliding(yellow_xs, yellow_ys)
+    yellow_fit = _fit_yellow_sliding(yellow_xs, yellow_ys)
     lane_seen = yellow_fit is not None
     if yellow_fit is None:
         return None
@@ -1260,7 +1058,7 @@ def plan(yellow_xs, yellow_ys, white_xs, white_ys, obstacles,
         "left_ys": _polyval_clipped(left_coef, sample_xs),
         "right_ys": _polyval_clipped(right_coef, sample_xs),
         "all_fits": [yellow_fit, left_coef, right_coef],
-        "mode": "child_yellow_dash" if child_zone else "yellow_center",
+        "mode": "yellow_center",
     }
 
 

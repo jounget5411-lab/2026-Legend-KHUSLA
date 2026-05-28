@@ -36,7 +36,7 @@ from std_msgs.msg import Bool
 # LANE 모드: 친구 plan() + 헬퍼 (lane_planner.py = 친구 path_planner_node.py 원본)
 from .lane_planner import plan as lane_plan
 from .lane_planner import (
-    YELLOW_CLS_IDS, YELLOW_DASH_CLS_IDS, WHITE_CLS_IDS, PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
+    YELLOW_CLS_IDS, WHITE_CLS_IDS, PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
     _polyval_clipped, _sample_xs, _yellow_inlier_xs, _yellow_inlier_ys,
 )
 
@@ -240,8 +240,6 @@ class PathPlannerNode(Node):
         # LANE 데이터 (친구 _on_lane과 동일 구조)
         self._yellow_xs = np.array([], dtype=np.float64)
         self._yellow_ys = np.array([], dtype=np.float64)
-        self._yellow_dash_xs = np.array([], dtype=np.float64)
-        self._yellow_dash_ys = np.array([], dtype=np.float64)
         self._white_xs = np.array([], dtype=np.float64)
         self._white_ys = np.array([], dtype=np.float64)
         self._has_lane = False
@@ -251,7 +249,6 @@ class PathPlannerNode(Node):
 
         # LANE 모드 중앙선 (사람 감지 기준선)
         self._lane_center_coef = None
-        self._last_lane_result = None
 
         # IMU heading
         self._heading_deg = 0.0
@@ -280,11 +277,10 @@ class PathPlannerNode(Node):
         self._pub_child = self.create_publisher(Bool, "/child_zone", 10)
         self._pub_slow = self.create_publisher(Bool, "/slow_after_turn", 10)
         self._pub_slow_merge = self.create_publisher(Bool, "/slow_merge", 10)
-        self._pub_cone = self.create_publisher(Bool, "/cone_mode", 10)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
         self._log_counter = 0
-        self.get_logger().info("PLANNER")
+        self.get_logger().info("path_planner_node started (WAIT→CONE→LANE)")
 
     # ---- 콜백 ----
 
@@ -298,8 +294,6 @@ class PathPlannerNode(Node):
         if not msg.poses:
             self._yellow_xs = np.array([], dtype=np.float64)
             self._yellow_ys = np.array([], dtype=np.float64)
-            self._yellow_dash_xs = np.array([], dtype=np.float64)
-            self._yellow_dash_ys = np.array([], dtype=np.float64)
             self._white_xs = np.array([], dtype=np.float64)
             self._white_ys = np.array([], dtype=np.float64)
             return
@@ -310,12 +304,9 @@ class PathPlannerNode(Node):
         cls = np.fromiter((int(p.position.z) for p in msg.poses),
                           dtype=np.int32, count=len(msg.poses))
         ym = np.isin(cls, list(YELLOW_CLS_IDS))
-        dm = np.isin(cls, list(YELLOW_DASH_CLS_IDS))
         wm = np.isin(cls, list(WHITE_CLS_IDS))
         self._yellow_xs = xs[ym]
         self._yellow_ys = ys[ym]
-        self._yellow_dash_xs = xs[dm]
-        self._yellow_dash_ys = ys[dm]
         self._white_xs = xs[wm]
         self._white_ys = ys[wm]
 
@@ -389,7 +380,7 @@ class PathPlannerNode(Node):
 
         if self.phase == "IDLE":
             if len(self._obstacles) > 0 or self._has_lane:
-                self.get_logger().info("WAIT")
+                self.get_logger().info("Sim connected → WAIT")
                 self.phase = "WAIT"
             return
         elif self.phase == "WAIT":
@@ -418,31 +409,26 @@ class PathPlannerNode(Node):
         elif self.phase == "OVERTAKE":
             self._tick_overtake(stamp)
 
-        self._pub_cone.publish(Bool(data=(self.phase == "CONE")))
-
         # 로그
         self._log_counter += 1
         if self._log_counter >= PLAN_HZ:
             self._log_counter = 0
-            phase_log = self.phase
+            extra = ""
             if self.phase == "SHORTCUT":
-                phase_log = {
-                    "WAITING": "SC WAIT",
-                    "TURNING_1": "SC LT1",
-                    "FOLLOW": "SC RUN",
-                    "TURNING_2": "SC LT2",
-                }.get(self._sc_sub, "SC")
-            elif self.phase == "OVERTAKE":
-                phase_log = {
-                    "LANE_TO_2ND": "OT START",
-                    "PASSING": "OT PASS",
-                    "CAR_BESIDE": "OT SIDE",
-                    "RETURN_TO_1ST": "OT RET",
-                    "MERGE": "OT MERGE",
-                }.get(self._ot_sub, "OT")
-            elif self._child_zone:
-                phase_log = "CHILD"
-            self.get_logger().info(phase_log)
+                extra = (f" sub={self._sc_sub} tick={self._sc_tick}"
+                         f" left_hits={self._left_signal_hits}")
+            if self._stop_max_v is not None:
+                extra += f" stop_v={self._stop_max_v:.0f}"
+            if self._cross_max_v is not None:
+                extra += f" cross_v={self._cross_max_v:.0f}"
+            extra += f" hdg={self._heading_deg:+.1f}"
+            if self._child_zone:
+                extra += " CHILD_ZONE"
+            evts = [EVT_NAMES.get(e, str(e)) for e in self._events
+                    if e in EVT_NAMES]
+            if evts:
+                extra += f" evts={evts}"
+            self.get_logger().info(f"phase={self.phase}{extra}")
 
     # ---- WAIT ----
 
@@ -453,20 +439,21 @@ class PathPlannerNode(Node):
         if self._wait_green_ticks > 0:
             self._wait_green_ticks -= 1
             if self._wait_green_ticks <= 0:
-                self.get_logger().info("CONE")
+                self.get_logger().info("GREEN delay done → CONE")
                 self.phase = "CONE"
                 self._cone_grace = CONE_GRACE_TICKS
                 self._cone_miss = 0
                 self._start_grace_ticks = 400  # 출발 후 20초간 STOP 무시
                 self._pub_estop.publish(Bool(data=False))
             elif self._wait_green_ticks % PLAN_HZ == 0:
-                self.get_logger().info("GREEN")
+                self.get_logger().info(
+                    f"[WAIT] GREEN seen, departing in {self._wait_green_ticks} ticks")
             return
 
         if GREEN_CLS_ID in self._events:
             self._wait_green_ticks = 80  # 4초 (20Hz)
 
-            self.get_logger().info("GREEN")
+            self.get_logger().info("GREEN detected → departing in 4.5s")
 
     # ---- CONE ----
 
@@ -493,6 +480,10 @@ class PathPlannerNode(Node):
 
             lx, ly = all_x[left_mask], all_y[left_mask]
             self._cone_left_count = lx.size
+            # 디버그: 모든 콘 + 왼쪽 판별 결과
+            self.get_logger().info(
+                f"[CONE_DBG] method={method} all={list(zip([f'{x:.1f}' for x in all_x],[f'{y:.1f}' for y in all_y]))} "
+                f"left={list(zip([f'{x:.1f}' for x in lx],[f'{y:.1f}' for y in ly]))}")
             if lx.size >= CONE_FIT_MIN_POINTS:
                 x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
                 if x_span >= CONE_FIT_MIN_X_SPAN:
@@ -521,7 +512,8 @@ class PathPlannerNode(Node):
             else:
                 self._cone_prev_fit = None
                 if self._cone_grace <= 0 and self._cone_miss >= CONE_TO_LANE_MISS:
-                    self.get_logger().info("LANE")
+                    self.get_logger().info(
+                        f"cones gone (miss={self._cone_miss}) → LANE")
                     self.phase = "LANE"
                     self._tick_lane(stamp)  # 즉시 차선 경로 발행 (경로 끊김 방지)
                     return
@@ -579,7 +571,8 @@ class PathPlannerNode(Node):
                 self._child_exit_timer = 0
                 self._child_total_ticks = 0
                 self._pub_child.publish(Bool(data=True))
-                self.get_logger().info("CHILD ON")
+                self.get_logger().info(
+                    f"CHILD_ZONE enter (v={self._child_start_max_v:.0f})")
         else:
             self._child_total_ticks += 1
             # hard timeout
@@ -587,7 +580,7 @@ class PathPlannerNode(Node):
                 self._child_zone = False
                 self._child_exit_cooldown = CHILD_EXIT_COOLDOWN_TICKS
                 self._pub_child.publish(Bool(data=False))
-                self.get_logger().info("CHILD OFF")
+                self.get_logger().info("CHILD_ZONE forced exit (15s timeout)")
                 return
             # 해제 판단
             if self._child_exit_timer > 0:
@@ -596,14 +589,16 @@ class PathPlannerNode(Node):
                     self._child_zone = False
                     self._child_exit_cooldown = CHILD_EXIT_COOLDOWN_TICKS
                     self._pub_child.publish(Bool(data=False))
-                    self.get_logger().info("CHILD OFF")
+                    self.get_logger().info("CHILD_ZONE exit (delay done)")
                 return
             if self._child_enter_cooldown > 0:
                 return
             if (self._child_end_max_v is not None
                     and self._child_end_max_v >= CHILD_END_V_THR):
                 self._child_exit_timer = CHILD_EXIT_DELAY_TICKS
-                self.get_logger().info("CHILD END")
+                self.get_logger().info(
+                    f"CHILD_END near (v={self._child_end_max_v:.0f}) "
+                    f"→ exit in {CHILD_EXIT_DELAY_TICKS} ticks")
 
     # ---- PEDESTRIAN: 사람 감지 → 정지 → 도로 밖으로 나가면 출발 ----
 
@@ -626,6 +621,9 @@ class PathPlannerNode(Node):
             dist = abs(oy - center_y)
             if dist <= PED_ROAD_HALF_WIDTH:
                 road_obs.append((ox, oy, _r))
+                self.get_logger().info(
+                    f"[PED_DBG] obs({ox:.1f},{oy:.1f}) r={_r:.2f} "
+                    f"center_y={center_y:.2f} dist={dist:.2f}")
 
         if not road_obs:
             return
@@ -643,7 +641,9 @@ class PathPlannerNode(Node):
 
         # 사람: 도로 안 클러스터 1~2개, 밀집 아님
         ox, oy, _r = road_obs[0]
-        self.get_logger().info("PED")
+        self.get_logger().info(
+            f"PEDESTRIAN detected at ({ox:.1f},{oy:.1f}) "
+            f"road_obs={len(road_obs)} dense={dense_count} → STOP")
         self._ped_timer = PED_MIN_STOP_TICKS
         self.phase = "PEDESTRIAN"
         from std_msgs.msg import Bool
@@ -673,7 +673,8 @@ class PathPlannerNode(Node):
                 if abs(oy - center_y) < PED_ROAD_HALF_WIDTH:
                     # 도로 안에 있음 — 중앙선 넘었나?
                     if oy > center_y:
-                        self.get_logger().info("LANE")
+                        self.get_logger().info(
+                            f"Pedestrian crossed center ({ox:.1f},{oy:.1f}) cy={center_y:.2f} → LANE")
                         self._pub_estop.publish(Bool(data=False))
                         self._ped_cooldown = PED_COOLDOWN_TICKS
                         self.phase = "LANE"
@@ -682,7 +683,7 @@ class PathPlannerNode(Node):
                         return  # 아직 오른쪽 → 계속 정지
 
         # 장애물 사라짐 → 출발
-        self.get_logger().info("LANE")
+        self.get_logger().info("Pedestrian gone → LANE (cooldown 20s)")
         self._pub_estop.publish(Bool(data=False))
         self._ped_cooldown = PED_COOLDOWN_TICKS
         self.phase = "LANE"
@@ -707,7 +708,7 @@ class PathPlannerNode(Node):
         if self._red_stopping:
             if GREEN_CLS_ID in self._events and police_recent:
                 self._pub_estop.publish(Bool(data=False))
-                self.get_logger().info("GO")
+                self.get_logger().info("GREEN + POLICE recent → GO")
                 self._red_stopping = False
                 return False
             if GREEN_CLS_ID in self._events and not police_recent:
@@ -718,7 +719,7 @@ class PathPlannerNode(Node):
                 self._sc_tick = 0
                 self._left_signal_hits = 0
                 self._pub_estop.publish(Bool(data=True))
-                self.get_logger().info("SC WAIT")
+                self.get_logger().info("GREEN + no POLICE → SHORTCUT.WAITING (LEFT 대기)")
                 return True
             self._pub_estop.publish(Bool(data=True))
             self._tick_lane(stamp)
@@ -729,7 +730,8 @@ class PathPlannerNode(Node):
             return False
         if GREEN_CLS_ID in self._events and police_recent:
             return False  # POLICE 교차로 + 초록불 → 그냥 통과
-        self.get_logger().info("STOP")
+        self.get_logger().info(
+            f"stopline (v={self._stop_max_v:.0f}) no GREEN → STOP")
         self._red_stopping = True
         self._pub_estop.publish(Bool(data=True))
         self._tick_lane(stamp)
@@ -750,7 +752,9 @@ class PathPlannerNode(Node):
         # POLICE 보이면 지름길 포기 — 같은 정지선 다시 안 트리거하게 쿨다운
         if POLICE_CLS_ID in self._events:
             self._sc_cooldown = SC_BYPASS_COOLDOWN_TICKS
-            self.get_logger().info("POLICE")
+            self.get_logger().info(
+                f"POLICE detected at stopline (v={self._stop_max_v:.0f}) "
+                f"→ bypass shortcut ({SC_BYPASS_COOLDOWN_TICKS} tick cooldown)")
             return
 
         # 진입
@@ -759,7 +763,8 @@ class PathPlannerNode(Node):
         self._sc_tick = 0
         self._left_signal_hits = 0
         self._pub_estop.publish(Bool(data=True))
-        self.get_logger().info("SC WAIT")
+        self.get_logger().info(
+            f"STOP near (v={self._stop_max_v:.0f}) + no POLICE → SHORTCUT.WAITING")
 
     def _tick_shortcut(self, stamp):
         """SHORTCUT sub-state dispatch."""
@@ -773,7 +778,7 @@ class PathPlannerNode(Node):
             self._tick_sc_turning(stamp, after="LANE")
         else:
             # 알 수 없는 sub — 안전망
-            self.get_logger().warn("SC ERR")
+            self.get_logger().warn(f"Unknown sc_sub={self._sc_sub} → LANE 복귀")
             self._exit_shortcut_to_lane()
 
     def _tick_sc_waiting(self, stamp):
@@ -788,13 +793,18 @@ class PathPlannerNode(Node):
             self._left_signal_hits = max(0, self._left_signal_hits - 1)
 
         if self._sc_tick % PLAN_HZ == 0:
-            self.get_logger().info("SC WAIT")
+            evt_names = [EVT_NAMES.get(e, str(e)) for e in self._events
+                         if e in EVT_NAMES]
+            self.get_logger().info(
+                f"[SC_WAIT] tick={self._sc_tick} LEFT_hits={self._left_signal_hits}"
+                f"/{LEFT_SIGNAL_DEBOUNCE_TICKS} evts={evt_names}")
 
         if self._left_signal_hits >= LEFT_SIGNAL_DEBOUNCE_TICKS:
             self._pub_estop.publish(Bool(data=False))
             self._sc_sub = "TURNING_1"
             self._sc_tick = 0
-            self.get_logger().info("LT1")
+            self.get_logger().info(
+                f"LEFT signal confirmed ({self._left_signal_hits} hits) → TURNING_1")
 
     def _tick_sc_turning(self, stamp, after):
         """좌회전: motion_node에 /left_turn1 or /left_turn2 신호."""
@@ -807,15 +817,16 @@ class PathPlannerNode(Node):
 
         ticks = SC_TURN_TICKS
         if self._sc_tick % PLAN_HZ == 0:
-            self.get_logger().info("SC TURN")
+            self.get_logger().info(
+                f"[SC_TURN] tick={self._sc_tick}/{ticks} after={after}")
 
         if self._sc_tick >= ticks:
             if after == "FOLLOW":
                 self._sc_sub = "FOLLOW"
                 self._sc_tick = 0
-                self.get_logger().info("SC FOLLOW")
+                self.get_logger().info("TURNING_1 done → FOLLOW (지름길 차선 추종)")
             elif after == "LANE":
-                self.get_logger().info("LANE")
+                self.get_logger().info("TURNING_2 done → LANE 복귀")
                 self._exit_shortcut_to_lane()
 
     def _tick_sc_follow(self, stamp):
@@ -824,12 +835,15 @@ class PathPlannerNode(Node):
         self._sc_tick += 1
 
         if self._sc_tick % PLAN_HZ == 0:
-            self.get_logger().info("SC FOLLOW")
+            self.get_logger().info(
+                f"[SC_FOLLOW] tick={self._sc_tick}/{SC_FOLLOW_HARD_TIMEOUT_TICKS} "
+                f"cross_v={self._cross_max_v} (thr={CROSS_V_THRESHOLD})")
 
         if self._cross_max_v is not None and self._cross_max_v >= CROSS_V_THRESHOLD:
             self._sc_sub = "TURNING_2"
             self._sc_tick = 0
-            self.get_logger().info("LT2")
+            self.get_logger().info(
+                f"CROSSROAD near (v={self._cross_max_v:.0f}) → TURNING_2")
             return
 
         # # 종료 조건 2: hard timeout (임시 비활성화)
@@ -842,7 +856,8 @@ class PathPlannerNode(Node):
 
     def _exit_shortcut_to_lane(self):
         """SHORTCUT 종료 → LANE 복귀, 재진입 쿨다운 설정."""
-        self.get_logger().info("LANE")
+        self.get_logger().info(
+            f"SHORTCUT done → LANE (cooldown {SC_DONE_COOLDOWN_TICKS} ticks, slow 3s)")
         self.phase = "LANE"
         self._sc_sub = None
         self._sc_tick = 0
@@ -856,7 +871,7 @@ class PathPlannerNode(Node):
         self._child_exit_timer = 0
         self._child_total_ticks = 0
         self._pub_child.publish(Bool(data=True))
-        self.get_logger().info("CHILD ON")
+        self.get_logger().info("CHILD_ZONE forced after SHORTCUT")
 
     def _publish_left_arc(self, stamp):
         """원점에서 좌측으로 휘는 호를 /center_path와 /target으로 발행.
@@ -889,7 +904,8 @@ class PathPlannerNode(Node):
         self._ot_tick = 0
         self._ot_right_fit = None
         self._ot_yellow_fit = None
-        self.get_logger().info("OT START")
+        self.get_logger().info(
+            f"CAR detected (v={self._car_max_v:.0f}) → OVERTAKE.LANE_TO_2ND")
 
     def _tick_overtake(self, stamp):
         """OVERTAKE sub-state dispatch."""
@@ -905,7 +921,7 @@ class PathPlannerNode(Node):
         elif self._ot_sub == "MERGE":
             self._tick_ot_merge(stamp)
         else:
-            self.get_logger().warn("OT ERR")
+            self.get_logger().warn(f"Unknown ot_sub={self._ot_sub} → LANE")
             self._exit_overtake()
 
     def _tick_ot_lane_to_2nd(self, stamp):
@@ -914,11 +930,12 @@ class PathPlannerNode(Node):
         if self._ot_yellow_fit is not None:
             self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_RIGHT_OFFSET)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT START")
+            self.get_logger().info(
+                f"[OT] LANE_TO_2ND tick={self._ot_tick}/{OT_LANE_TO_2ND_TICKS}")
         if self._ot_tick >= OT_LANE_TO_2ND_TICKS:
             self._ot_sub = "PASSING"
             self._ot_tick = 0
-            self.get_logger().info("OT PASS")
+            self.get_logger().info("OVERTAKE → PASSING (2차선 주행)")
 
     def _tick_ot_passing(self, stamp):
         """오른쪽 흰 실선 +1.5m로 2차선 주행. 왼쪽 라이다 감지 대기."""
@@ -926,11 +943,12 @@ class PathPlannerNode(Node):
         if self._ot_right_fit is not None:
             self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_OFFSET)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT PASS")
+            self.get_logger().info(
+                f"[OT] PASSING tick={self._ot_tick} left_det={self._left_side_detected}")
         if self._left_side_detected:
             self._ot_sub = "CAR_BESIDE"
             self._ot_tick = 0
-            self.get_logger().info("OT SIDE")
+            self.get_logger().info("OVERTAKE → CAR_BESIDE (왼쪽 감지, 흰선 왼쪽 5.5m)")
 
     def _tick_ot_car_beside(self, stamp):
         """왼쪽 감지 중 흰선 왼쪽 5.5m로 주행. 사라지면 RETURN."""
@@ -938,11 +956,12 @@ class PathPlannerNode(Node):
         if self._ot_right_fit is not None:
             self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_PASSING)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT SIDE")
+            self.get_logger().info(
+                f"[OT] CAR_BESIDE tick={self._ot_tick} left_det={self._left_side_detected}")
         if not self._left_side_detected:
             self._ot_sub = "RETURN_TO_1ST"
             self._ot_tick = 0
-            self.get_logger().info("OT RET")
+            self.get_logger().info("OVERTAKE → RETURN_TO_1ST (왼쪽 사라짐, 노란 왼쪽 2.0m)")
 
     def _tick_ot_car_passed(self, stamp):
         """차 지나간 후 2초 대기 (아직 2차선 유지)."""
@@ -954,7 +973,7 @@ class PathPlannerNode(Node):
         if self._ot_tick >= OT_CAR_PASSED_DELAY_TICKS:
             self._ot_sub = "RETURN_TO_1ST"
             self._ot_tick = 0
-            self.get_logger().info("OT RET")
+            self.get_logger().info("OVERTAKE → RETURN_TO_1ST (1차선 복귀)")
 
     def _tick_ot_return(self, stamp):
         """노란선 기준 왼쪽 2.3m로 5초 → MERGE."""
@@ -962,11 +981,12 @@ class PathPlannerNode(Node):
         if self._ot_yellow_fit is not None:
             self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_LEFT_OFFSET_1)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT RET")
+            self.get_logger().info(
+                f"[OT] RETURN tick={self._ot_tick}/{OT_RETURN_TICKS}")
         if self._ot_tick >= OT_RETURN_TICKS:
             self._ot_sub = "MERGE"
             self._ot_tick = 0
-            self.get_logger().info("OT MERGE")
+            self.get_logger().info("RETURN done → MERGE (노란 오른쪽 0.5m)")
             return
 
     def _tick_ot_merge(self, stamp):
@@ -975,9 +995,10 @@ class PathPlannerNode(Node):
         if self._ot_yellow_fit is not None:
             self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_RIGHT_MERGE)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT MERGE")
+            self.get_logger().info(
+                f"[OT] MERGE tick={self._ot_tick}/{OT_MERGE_TICKS}")
         if self._ot_tick >= OT_MERGE_TICKS:
-            self.get_logger().info("OT END")
+            self.get_logger().info("MERGE done → LANE")
             self._exit_overtake()
 
     def _exit_overtake(self):
@@ -1063,46 +1084,15 @@ class PathPlannerNode(Node):
 
     def _tick_lane(self, stamp):
         if not self._has_lane:
-            if self.phase == "LANE" and self._publish_last_lane(stamp):
-                return
             return
 
         result = lane_plan(self._yellow_xs, self._yellow_ys,
                            self._white_xs, self._white_ys,
-                           self._obstacles,
-                           child_zone=self._child_zone,
-                           yellow_dash_xs=self._yellow_dash_xs,
-                           yellow_dash_ys=self._yellow_dash_ys)
+                           self._obstacles)
 
         if result is None:
-            if self.phase == "LANE" and self._publish_last_lane(stamp):
-                return
             return
 
-        self._last_lane_result = self._copy_lane_result(result)
-        self._publish_lane_result(stamp, result)
-
-    @staticmethod
-    def _copy_lane_result(result):
-        return {
-            "target": tuple(result["target"]),
-            "sample_xs": np.asarray(result["sample_xs"], dtype=np.float64).copy(),
-            "sample_ys": np.asarray(result["sample_ys"], dtype=np.float64).copy(),
-            "left_ys": np.asarray(result["left_ys"], dtype=np.float64).copy(),
-            "right_ys": np.asarray(result["right_ys"], dtype=np.float64).copy(),
-            "all_fits": [
-                np.asarray(coef, dtype=np.float64).copy()
-                for coef in result.get("all_fits", [])
-            ],
-        }
-
-    def _publish_last_lane(self, stamp):
-        if self._last_lane_result is None:
-            return False
-        self._publish_lane_result(stamp, self._last_lane_result)
-        return True
-
-    def _publish_lane_result(self, stamp, result):
         # center_path의 coef 저장 (사람 감지 기준선으로 사용)
         all_fits = result.get("all_fits", [])
         if all_fits:

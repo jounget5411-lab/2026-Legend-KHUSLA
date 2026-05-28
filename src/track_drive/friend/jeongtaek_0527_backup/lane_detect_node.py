@@ -64,17 +64,14 @@ H_PIX2BEV = M_GRID @ H_PIX2LIDAR_FALLBACK
 
 CLS_WHITE_LANE = 6
 CLS_YELLOW_MID = 8
-CLS_YELLOW_DASH = 16
 LANE_CENTERLINE_BIN_M = 0.18
-YELLOW_DASH_CC_MAX_H = 42  # BEV 0.05m/px 기준 약 2.1m 이하만 점선 조각으로 본다.
-LANE_OPEN_KERNEL = np.ones((2, 2), np.uint8)
 
 
 def _filter_lane_mask(mask):
     if mask is None or mask.size == 0:
         return None
     mask = mask.astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, LANE_OPEN_KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
     thin = np.zeros_like(mask)
     for v in range(mask.shape[0]):
@@ -146,35 +143,6 @@ def _mask_to_centerline_xy(mask):
     return out_x[order], out_y[order]
 
 
-def _mask_to_yellow_dash_xy(mask):
-    """긴 실선이 아니라 짧게 끊긴 노란 컴포넌트만 따로 centerline으로 뽑는다."""
-    if mask is None or mask.size == 0 or not mask.any():
-        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
-
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
-    out_x = []
-    out_y = []
-    comp = np.zeros_like(mask, dtype=np.uint8)
-    for i in range(1, num):
-        area = stats[i, cv2.CC_STAT_AREA]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        if area < LANE_CC_MIN_AREA or h < LANE_CC_MIN_H or h > YELLOW_DASH_CC_MAX_H:
-            continue
-        comp_mask = labels == i
-        comp[comp_mask] = 255
-        xs, ys = _mask_to_centerline_xy(comp)
-        comp[comp_mask] = 0
-        out_x.extend(xs.tolist())
-        out_y.extend(ys.tolist())
-
-    if not out_x:
-        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
-    out_x = np.asarray(out_x, dtype=np.float32)
-    out_y = np.asarray(out_y, dtype=np.float32)
-    order = np.argsort(out_x)
-    return out_x[order], out_y[order]
-
-
 # ======================== ROS 노드 ========================
 
 class LaneDetectNode(Node):
@@ -192,22 +160,22 @@ class LaneDetectNode(Node):
             CameraInfo, "/usb_cam/camera_info/front",
             self._on_caminfo, qos_profile_sensor_data)
 
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         tf_static_qos = QoSProfile(
             depth=100,
             history=HistoryPolicy.KEEP_LAST,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(
-            self.tf_buffer, self, static_qos=tf_static_qos)
         self.create_subscription(TFMessage, "/tf_static",
                                  self._on_tf_static, tf_static_qos)
         self.create_timer(0.5, self._maybe_build_homography)
 
         self._pub_lane = self.create_publisher(PoseArray, "/detect/lane", 10)
         self._pub_quality = self.create_publisher(Float32, "/detect/lane_quality", 10)
-        self.get_logger().info("LANEDET")
+        self.get_logger().info(
+            "lane_detect_node started (dynamic BEV + fallback homography)")
 
     def _on_caminfo(self, msg):
         self._K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
@@ -237,7 +205,7 @@ class LaneDetectNode(Node):
 
         cam_ground_height = float(t[2] - GROUND_Z_IN_LIDAR)
         if abs(cam_ground_height) < 1e-3:
-            self.get_logger().warn("BEV Z")
+            self.get_logger().warn("camera z≈ground; keep fallback BEV homography")
             return
 
         plane_scale = GROUND_Z_IN_LIDAR - float(t[2])
@@ -272,7 +240,9 @@ class LaneDetectNode(Node):
         _, label, H_pix2lidar, x_chk, y_chk = best
         self._H_pix2bev = M_GRID @ H_pix2lidar
         self._dynamic_h_built = True
-        self.get_logger().info("BEV OK")
+        self.get_logger().info(
+            f"dynamic BEV homography ready [{label}], "
+            f"check=({x_chk:+.2f}, {y_chk:+.2f}) m")
 
     def _on_image(self, msg):
         img = self._image_to_rgb(msg)
@@ -289,7 +259,6 @@ class LaneDetectNode(Node):
         white_mask, yellow_mask = _extract_colored_lane_masks(bev)
         white_xs, white_ys = _mask_to_centerline_xy(white_mask)
         yellow_xs, yellow_ys = _mask_to_centerline_xy(yellow_mask)
-        yellow_dash_xs, yellow_dash_ys = _mask_to_yellow_dash_xy(yellow_mask)
 
         out = PoseArray()
         out.header = msg.header
@@ -299,12 +268,6 @@ class LaneDetectNode(Node):
             p.position.x = float(x)
             p.position.y = float(y)
             p.position.z = float(CLS_YELLOW_MID)
-            out.poses.append(p)
-        for x, y in zip(yellow_dash_xs, yellow_dash_ys):
-            p = Pose()
-            p.position.x = float(x)
-            p.position.y = float(y)
-            p.position.z = float(CLS_YELLOW_DASH)
             out.poses.append(p)
         for x, y in zip(white_xs, white_ys):
             p = Pose()
