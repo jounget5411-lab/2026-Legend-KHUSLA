@@ -33,6 +33,10 @@ setup(
             'key_control = track_drive.key_control_node:main',
             'test_white = track_drive.test_white_node:main',
             'test_viewer = track_drive.test_viewer_node:main',
+            'lane_curve = track_drive.lane_curve_node:main',
+            'yolo_lane = track_drive.yolo_lane_node:main',
+            'cam_record = track_drive.cam_record_node:main',
+            'yolo_lane_viewer = track_drive.yolo_lane_viewer_node:main',
         ],
     },
 )

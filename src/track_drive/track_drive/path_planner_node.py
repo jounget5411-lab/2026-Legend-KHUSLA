@@ -57,13 +57,13 @@ CONE_FIT_CURVE_MAX = 1.5
 CONE_FIT_SLOPE_MAX = 3.0
 CONE_LEFT_ACCEPT_DIST = 1.5
 CONE_FIT_SMOOTH_ALPHA = 0.20
-CONE_FIT_MAX_MISS = 14
+CONE_FIT_MAX_MISS = 39
 
 CONE_SAMPLE_X_START = 0.5
 CONE_SAMPLE_X_END = 6.0
 CONE_SAMPLE_N = 25
 
-CONE_TO_LANE_MISS = 30
+CONE_TO_LANE_MISS = 40
 CONE_GRACE_TICKS = 20          # 2초 (20Hz)
 
 # ======================== YOLO 클래스 ID (best.pt 학습 시점 기준) ========================
@@ -136,13 +136,13 @@ CHILD_HARD_TIMEOUT_TICKS = 340   # 17초 후 강제 해제 (20Hz)
 OT_CAR_V_THRESHOLD = 250.0       # BLACK_CAR/GREEN_CAR bbox v 이 이상이면 트리거
 OT_HEADING_MIN = 50.0            # 추월 허용 heading 최소 (도)
 OT_HEADING_MAX = 170.0           # 추월 허용 heading 최대 (도)
-OT_YELLOW_RIGHT_OFFSET = -1.8    # 노란선 기준 오른쪽 1.8m (2차선으로 이동)
+OT_YELLOW_RIGHT_OFFSET = -1.5    # 노란선 기준 오른쪽 1.5m (2차선으로 이동)
 OT_WHITE_LEFT_OFFSET = 0.8       # 오른쪽 흰선 기준 왼쪽 0.8m (2차선 주행)
 OT_WHITE_LEFT_PASSING = 5.5      # 왼쪽 감지 후 흰선 기준 왼쪽 5.5m
 OT_YELLOW_LEFT_OFFSET_1 = 2.0    # 왼쪽 사라진 후 노란선 기준 왼쪽 2.0m
 OT_YELLOW_RIGHT_MERGE = -0.5     # 노란선 기준 오른쪽 0.5m (합류)
 OT_MERGE_TICKS = 40              # 합류 주행 시간 (2초)
-OT_LANE_TO_2ND_TICKS = 120       # 2차선 이동 시간 (6초)
+OT_LANE_TO_2ND_TICKS = 100       # 2차선 이동 시간 (5초)
 OT_CAR_PASSED_DELAY_TICKS = 40   # 차 지나간 후 대기 (2초)
 OT_RETURN_TICKS = 60             # 1차선 복귀 시간 (3초 → MERGE)
 OT_LEFT_LIDAR_ANGLE = math.pi / 2   # 왼쪽 90도 (9시)
@@ -464,7 +464,7 @@ class PathPlannerNode(Node):
             return
 
         if GREEN_CLS_ID in self._events:
-            self._wait_green_ticks = 80  # 4초 (20Hz)
+            self._wait_green_ticks = 72  # 3.6초 (20Hz)
 
             self.get_logger().info("GREEN")
 
@@ -889,7 +889,7 @@ class PathPlannerNode(Node):
         self._ot_tick = 0
         self._ot_right_fit = None
         self._ot_yellow_fit = None
-        self.get_logger().info("OT START")
+        self.get_logger().info("OVERTAKE 진입 → 2차선1")
 
     def _tick_overtake(self, stamp):
         """OVERTAKE sub-state dispatch."""
@@ -914,11 +914,11 @@ class PathPlannerNode(Node):
         if self._ot_yellow_fit is not None:
             self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_RIGHT_OFFSET)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT START")
+            self.get_logger().info("2차선1")
         if self._ot_tick >= OT_LANE_TO_2ND_TICKS:
             self._ot_sub = "PASSING"
             self._ot_tick = 0
-            self.get_logger().info("OT PASS")
+            self.get_logger().info("→ 2차선2")
 
     def _tick_ot_passing(self, stamp):
         """오른쪽 흰 실선 +1.5m로 2차선 주행. 왼쪽 라이다 감지 대기."""
@@ -926,11 +926,11 @@ class PathPlannerNode(Node):
         if self._ot_right_fit is not None:
             self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_OFFSET)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT PASS")
+            self.get_logger().info("2차선2")
         if self._left_side_detected:
             self._ot_sub = "CAR_BESIDE"
             self._ot_tick = 0
-            self.get_logger().info("OT SIDE")
+            self.get_logger().info("→ 추월")
 
     def _tick_ot_car_beside(self, stamp):
         """왼쪽 감지 중 흰선 왼쪽 5.5m로 주행. 사라지면 RETURN."""
@@ -938,11 +938,11 @@ class PathPlannerNode(Node):
         if self._ot_right_fit is not None:
             self._ot_publish_path(stamp, self._ot_right_fit, OT_WHITE_LEFT_PASSING)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT SIDE")
+            self.get_logger().info("추월")
         if not self._left_side_detected:
             self._ot_sub = "RETURN_TO_1ST"
             self._ot_tick = 0
-            self.get_logger().info("OT RET")
+            self.get_logger().info("→ 1차선")
 
     def _tick_ot_car_passed(self, stamp):
         """차 지나간 후 2초 대기 (아직 2차선 유지)."""
@@ -962,11 +962,11 @@ class PathPlannerNode(Node):
         if self._ot_yellow_fit is not None:
             self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_LEFT_OFFSET_1)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT RET")
+            self.get_logger().info("1차선")
         if self._ot_tick >= OT_RETURN_TICKS:
             self._ot_sub = "MERGE"
             self._ot_tick = 0
-            self.get_logger().info("OT MERGE")
+            self.get_logger().info("→ 복귀")
             return
 
     def _tick_ot_merge(self, stamp):
@@ -975,9 +975,9 @@ class PathPlannerNode(Node):
         if self._ot_yellow_fit is not None:
             self._ot_publish_path(stamp, self._ot_yellow_fit, OT_YELLOW_RIGHT_MERGE)
         if self._ot_tick % PLAN_HZ == 0:
-            self.get_logger().info("OT MERGE")
+            self.get_logger().info("복귀")
         if self._ot_tick >= OT_MERGE_TICKS:
-            self.get_logger().info("OT END")
+            self.get_logger().info("OVERTAKE 완료 → LANE")
             self._exit_overtake()
 
     def _exit_overtake(self):

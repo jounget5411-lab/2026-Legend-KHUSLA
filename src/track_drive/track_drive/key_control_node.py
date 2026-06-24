@@ -33,24 +33,27 @@ SPEED_MAX = 50.0
 ANGLE_MAX = 100.0
 MOTOR_HZ = 10
 RECORD_HZ = 10
+DRIVE_SPEED_DEFAULT = 10.0   # 앞/뒤 주행 기본 속도 설정값
+STEER_HOLD_TICKS = 4         # 조향키 뗀 후 자동 복귀까지 (키 반복 간격 보완)
 
 ANGLE_PRESETS = {'1': 20.0, '2': 40.0, '3': 60.0, '4': 80.0, '5': 100.0, '6': 0.0}
 
 HELP_TEXT = """
 ========================================
-  키보드 제어 노드
+  키보드 제어 노드 (RC 모드)
 ========================================
+  ↑       : 전진 (설정속도로)
+  ↓       : 후진
+  ←       : 좌조향 최대
+  →       : 우조향 최대
+  W       : 설정속도 +1
+  S       : 설정속도 -1
+  Space   : 정지 (속도+조향 0)
+  X       : 조향만 0 (직진)
+  E       : 속도만 0 (조향 유지)
   Q       : 자동/수동 토글
-  W / ↑   : 속도 +
-  S / ↓   : 속도 -
-  A / ←   : 좌회전 +5
-  D / →   : 우회전 -5
-  Space   : 정지
-  E       : speed=0 (조향 유지)
-  1~5     : angle 고정 (20/40/60/80/100)
-  6       : angle = 0 (직진)
   M       : 기록 ON/OFF (조향 측정)
-  I       : IMU heading 기록 ON/OFF (imu_heading.txt)
+  I       : IMU heading 기록 ON/OFF
   C       : 트랙 폭 측정
   Ctrl+C  : 종료
 ========================================
@@ -81,6 +84,8 @@ class KeyControlNode(Node):
         self._auto_mode = False
         self._speed = 0.0
         self._angle = 0.0
+        self._drive_speed = DRIVE_SPEED_DEFAULT  # 전/후진 속도 설정값
+        self._steer_hold = 0                      # 조향 유지 카운터 (0이면 직진 복귀)
 
         self._recording = False
         self._record_file = None
@@ -128,6 +133,11 @@ class KeyControlNode(Node):
     def _publish_motor(self):
         if self._auto_mode:
             return
+        # 조향 자동복귀: 방향키 안 눌리면 hold 소진되며 직진 복귀
+        if self._steer_hold > 0:
+            self._steer_hold -= 1
+            if self._steer_hold == 0:
+                self._angle = 0.0
         msg = XycarMotor()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "base_link"
@@ -205,18 +215,32 @@ class KeyControlNode(Node):
         if self._auto_mode:
             return
 
-        if key in ('w', 'W', 'UP'):
-            self._speed = min(self._speed + SPEED_STEP, SPEED_MAX)
-        elif key in ('s', 'S', 'DOWN'):
-            self._speed = max(self._speed - SPEED_STEP, -SPEED_MAX)
-        elif key in ('a', 'A', 'LEFT'):
-            self._angle = min(self._angle + ANGLE_STEP, ANGLE_MAX)
-        elif key in ('d', 'D', 'RIGHT'):
-            self._angle = max(self._angle - ANGLE_STEP, -ANGLE_MAX)
-        elif key == ' ':
+        if key == 'UP':                       # 전진 (설정속도)
+            self._speed = self._drive_speed
+        elif key == 'DOWN':                   # 후진
+            self._speed = -self._drive_speed
+        elif key == 'LEFT':                   # 좌조향 최대 (누르는 동안만)
+            self._angle = -ANGLE_MAX
+            self._steer_hold = STEER_HOLD_TICKS
+        elif key == 'RIGHT':                  # 우조향 최대 (누르는 동안만)
+            self._angle = ANGLE_MAX
+            self._steer_hold = STEER_HOLD_TICKS
+        elif key in ('w', 'W'):               # 설정속도 +
+            self._drive_speed = min(self._drive_speed + SPEED_STEP, SPEED_MAX)
+            if self._speed > 0:
+                self._speed = self._drive_speed
+        elif key in ('s', 'S'):               # 설정속도 -
+            self._drive_speed = max(self._drive_speed - SPEED_STEP, 0.0)
+            if self._speed > 0:
+                self._speed = self._drive_speed
+        elif key in ('x', 'X'):               # 조향만 0
+            self._angle = 0.0
+            self._steer_hold = 0
+        elif key == ' ':                      # 완전 정지
             self._speed = 0.0
             self._angle = 0.0
-        elif key in ('e', 'E'):
+            self._steer_hold = 0
+        elif key in ('e', 'E'):               # 속도만 0
             self._speed = 0.0
 
         self._show_state()
@@ -238,8 +262,8 @@ class KeyControlNode(Node):
 
     def _show_state(self):
         rec = " [REC]" if self._recording else ""
-        print(f"\r  speed={self._speed:+6.1f}  angle={self._angle:+6.1f}{rec}    ",
-              end="", flush=True)
+        print(f"\r  set={self._drive_speed:4.1f}  speed={self._speed:+6.1f}  "
+              f"angle={self._angle:+6.1f}{rec}    ", end="", flush=True)
 
 
 def main(args=None):

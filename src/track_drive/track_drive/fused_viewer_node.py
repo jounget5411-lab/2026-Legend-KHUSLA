@@ -89,8 +89,8 @@ LANE_RIGHT_TOPIC = "/lane_right"
 
 # test_viewer와 동일한 표시용 BEV/마스크/장애물 파라미터.
 BEV_RES = 0.05
-BEV_X_MIN, BEV_X_MAX = -2.0, 10.0
-BEV_Y_HALF = 4.0
+BEV_X_MIN, BEV_X_MAX = -2.0, 12.0   # common.py와 일치 (전방 12m까지 표시)
+BEV_Y_HALF = 5.0                     # 좌우 ±5m
 BEV_W = int(round((2 * BEV_Y_HALF) / BEV_RES))
 BEV_H = int(round((BEV_X_MAX - BEV_X_MIN) / BEV_RES))
 M_GRID = np.array([
