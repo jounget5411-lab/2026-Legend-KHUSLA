@@ -37,6 +37,11 @@ setup(
             'yolo_lane = track_drive.yolo_lane_node:main',
             'cam_record = track_drive.cam_record_node:main',
             'yolo_lane_viewer = track_drive.yolo_lane_viewer_node:main',
+            'merge_motion = track_drive.merge_motion_node:main',
+            'steer_calib = track_drive.steer_calib_node:main',
+            'imu_logger = track_drive.imu_logger_node:main',
+            'ot_tune = track_drive.ot_tune_node:main',
+            'yolo_print = track_drive.yolo_print_node:main',
         ],
     },
 )

@@ -37,7 +37,7 @@ from xycar_msgs.msg import XycarMotor
 SPEED_STEP = 1.0
 ANGLE_MAX = 100.0
 DRIVE_SPEED_DEFAULT = 10.0
-STEER_HOLD_TICKS = 4        # 조향키 뗀 후 직진 복귀까지
+STEER_HOLD_TICKS = 20       # 조향키 뗀 후 직진 복귀까지 (키 auto-repeat 초기지연 보완, 1초)
 MOTOR_HZ = 20
 
 HELP = """
