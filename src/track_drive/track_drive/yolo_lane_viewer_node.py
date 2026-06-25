@@ -93,6 +93,56 @@ class YoloLaneViewer(Node):
         for i in range(len(pts) - 1):
             cv2.line(img, _to_px(*pts[i]), _to_px(*pts[i + 1]), color, thick)
 
+    @staticmethod
+    def _fit_xy(xs, ys):
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        if xs.size < 6 or float(xs.max() - xs.min()) < 1.0:
+            return None
+        try:
+            return np.polyfit(xs, ys, 2)
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+
+    def _commanded_offset(self, x_eval=2.0):
+        """목표경로(center_path)와 검출 중앙선(mid, cls=8)의 가로차 @ x_eval = 적용 offset(좌+/우-)."""
+        if not self._center or not self._lane:
+            return None
+        c = np.asarray(self._center, dtype=np.float64)
+        i = int(np.argmin(np.abs(c[:, 0] - x_eval)))
+        cpath_y = float(c[i, 1])
+        a = np.asarray(self._lane, dtype=np.float64)
+        m = a[a[:, 2].astype(int) == 8]
+        if m.shape[0] < 6:
+            return None
+        coef = self._fit_xy(m[:, 0], m[:, 1])
+        if coef is None:
+            return None
+        return cpath_y - float(np.polyval(coef, x_eval))
+
+    def _draw_base_fits(self, img):
+        """mid/흰선 점구름에서 중앙선·왼흰선·오른흰선을 각각 2차 피팅하고
+        각 기준선과 ±1.5m offset(차선 중심 후보)을 그린다."""
+        if not self._lane:
+            return
+        arr = np.asarray(self._lane, dtype=np.float64)   # (N,3): x, y, cls
+        xs, ys = arr[:, 0], arr[:, 1]
+        cls = arr[:, 2].astype(int)
+        white = (cls == 6) | (cls == 2)
+        groups = [
+            (xs[cls == 8], ys[cls == 8], (0, 255, 0)),                    # 노란 중앙선 → 초록
+            (xs[white & (ys > 0)], ys[white & (ys > 0)], (255, 255, 0)),  # 왼쪽 흰선 → 시안
+            (xs[white & (ys < 0)], ys[white & (ys < 0)], (255, 0, 255)),  # 오른쪽 흰선 → 마젠타
+        ]
+        sx = np.linspace(0.5, 11.0, 45)
+        for gx, gy, color in groups:
+            coef = self._fit_xy(gx, gy)
+            if coef is None:
+                continue
+            base = np.polyval(coef, sx)
+            for off, thick in ((1.5, 1), (0.0, 2), (-1.5, 1)):
+                self._poly(img, list(zip(sx, base + off)), color, thick)
+
     def _draw(self):
         img = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
 
@@ -133,10 +183,8 @@ class YoloLaneViewer(Node):
                 cv2.circle(img, (px, py), 3, color, -1)
             counts[c] = counts.get(c, 0) + 1
 
-        # 큐빅 중앙선(파랑) / 주행선(주황) / 최종경로(초록)
-        self._poly(img, self._left, (255, 120, 0), 1)
-        self._poly(img, self._right, (0, 140, 255), 1)
-        self._poly(img, self._center, (0, 255, 0), 2)        # 레퍼런스(초록)
+        # path_planner 목표경로 = offset 적용된 commanded path (굵은 마젠타)
+        self._poly(img, self._center, (255, 0, 255), 3)
 
         # 타겟
         if self._target is not None:
@@ -149,8 +197,17 @@ class YoloLaneViewer(Node):
             cv2.putText(img, f"{name}: {n}", (10, y0),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
             y0 += 18
-        cv2.putText(img, "center_path(ref)", (10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        cv2.putText(img, "TARGET path (magenta)", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+        y0 += 20
+        off = self._commanded_offset()
+        if off is not None:
+            side = "L" if off > 0 else "R"
+            cv2.putText(img, f"offset: {off:+.2f}m ({side})", (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
+        else:
+            cv2.putText(img, "offset: (no mid)", (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
 
         cv2.imshow("yolo_lane_viewer", img)
         cv2.waitKey(1)

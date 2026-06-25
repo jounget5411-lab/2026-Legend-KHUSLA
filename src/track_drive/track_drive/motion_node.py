@@ -33,9 +33,15 @@ STRAIGHT_BOOST_PURSUIT_GAIN = 0.40
 STRAIGHT_BOOST_HEADING_GAIN = 0.40
 CURVE_PURSUIT_GAIN = 1.62
 CURVE_HEADING_GAIN = 2.22
-STEER_FOCUS_X = 4.2      # reanchor 이후 가중 peak 위치 (m) — 더 멀리 보게 (wider view)
-OT_STEER_FOCUS_X = 3.0   # 추월 중 lookahead (2.3→3.0, 너무 짧아서 늘림)
-STEER_FOCUS_SIGMA = 2.4  # 가중 폭 (m, sigma) - 커브를 조금 미리 본다
+STEER_FOCUS_X = 4.2      # (평상시는 속도비례로 대체) 미사용 고정값
+OT_STEER_FOCUS_X = 3.2   # 추월 중 lookahead (3.0→3.2)
+S_STEER_FOCUS_X = 3.7    # S자(s_zone) 전용 lookahead (→3.7)
+STEER_FOCUS_SIGMA = 1.8  # 가중 폭 (m, sigma) — 줄임
+# 평상시 속도비례 lookahead: focus_x = clip(BASE + K*직전속도, MIN, MAX) — 빠를수록 멀리 봐 위빙↓
+STEER_FOCUS_BASE = 3.8
+STEER_FOCUS_K = 0.055
+STEER_FOCUS_MIN = 4.2
+STEER_FOCUS_MAX = 5.0
 STEER_GAIN_DISTANCE_M = 2.4
 STEER_PREVIEW_DISTANCE_M = 5.5
 STEER_HEADING_START_DEG = 4.0
@@ -57,13 +63,13 @@ ANGLE_MAX = 100.0
 LEFT_TURN_ANGLE = -100.0          # 좌회전 하드코딩 조향각
 LEFT_TURN_SPEED = 10.0            # 좌회전 속도
 LEFT_TURN1_TICKS = 50             # TURNING_1 지속 (50 ticks = 2.5초)
-LEFT_TURN2_TICKS = 50             # TURNING_2 지속 (50 ticks = 2.5초)
-CHILD_ZONE_SPEED = 15.5            # 어린이 보호구역 속도 제한 (→15.5)
+LEFT_TURN2_TICKS = 48             # TURNING_2 지속 (48 ticks = 2.4초 @20Hz)
+CHILD_ZONE_SPEED = 15.0            # 어린이 보호구역 속도 제한 (→15.5)
 SLOW_AFTER_TURN_SPEED = 5.0       # 좌회전 직후 감속
 SLOW_AFTER_TURN_TICKS = 60        # 3초 (20Hz)
 SLOW_MERGE_SPEED = 7.0            # (미사용) 과거 추월 합류 감속
-SHORTCUT_SPEED = 15.0            # 지름길(SHORTCUT) 직선 속도 (기본 22보다 낮춤, →15)
-CONE_SPEED_FIXED = 13.0           # 라바콘 구간 고정 속도 (12→13)
+SHORTCUT_SPEED = 14.0            # 지름길(SHORTCUT) 직선 속도 (기본 22보다 낮춤, →15)
+CONE_SPEED_FIXED = 15.0           # 라바콘 구간 고정 속도 (15→16)
 CONE_STEER_GAIN = 1.12            # 라바콘 구간 조향 보정
 # 응답 빠르게 하려고 alpha up (한 프레임에 변화의 75% 반영).
 ANGLE_SMOOTH_ALPHA = 0.55
@@ -75,7 +81,7 @@ ANGLE_DEADBAND = 0.6
 SPEED_CMD_MAX = 100.0
 SIM_CORNER_OBSERVED_KMH = 5.0
 SIM_CORNER_OBSERVED_CMD = 4.5
-SIM_CORNER_TARGET_KMH = 8.0
+SIM_CORNER_TARGET_KMH = 8.0       # 코너 안 목표 km/h (10→8 롤백 → CORNER_INSIDE_SPEED 7.2)
 
 
 def _map_kmh_to_speed_cmd(kmh):
@@ -85,15 +91,17 @@ def _map_kmh_to_speed_cmd(kmh):
     return float(np.clip(cmd, 0.0, SPEED_CMD_MAX))
 
 
-SPEED_DEFAULT = 22.0
-SPEED_CURVE_BASE = 20.0           # 일반 코너 (S자 아닌)
-S_CURVE_SPEED = 8.0               # S자 코너 속도 (10→8, 좀만 감속)
+SPEED_DEFAULT = 18.0
+SPEED_CURVE_BASE = 18.0           # 일반 코너 (S자 아닌)
+S_CURVE_SPEED = 7.0               # S자 코너 cap
 SPEED_MIN = 3.0
 SPEED_STOP = 0.0
 SPEED_SLOW_START_DEG = 12.0
 SPEED_SLOW_FULL_DEG = 40.0
 PREVIEW_SLOW_SPEED = 4.5          # 커브 preview 최저속 (3.2→4.5)
 STRAIGHT_CONFIRM_TICKS = 20       # 직진 이만큼(약1초@20Hz) 지속돼야 풀가속 허용
+LANE_LOST_SPEED = 7.0             # 경로 소실 시 복구 주행 속도 (5→7)
+LANE_LOST_MIN_ANGLE = 5.0         # 직전 조향이 이 이하면 복구 시 최대조향 안 하고 직진
 CORNER_INSIDE_SPEED = _map_kmh_to_speed_cmd(SIM_CORNER_TARGET_KMH)
 CORNER_BOOST_SPEED = _map_kmh_to_speed_cmd(10.0)   # 어린이보호 종료 후 코너 부스트(보수적, 10km/h)
 CORNER_ENTER_RATIO = 0.55
@@ -144,6 +152,7 @@ class MotionNode(Node):
         self._ot_speed_cap = 0.0         # /overtake_speed 캡 (>0이면 적용)
         self._manual_lookahead = 0.0     # ot_tune lookahead override (>0이면 적용)
         self._manual_la_hold = 0         # 수신 유지 카운트(끊기면 해제)
+        self._last_speed = 0.0           # 직전 틱 주행속도 (속도비례 lookahead용)
         self._cone_mode = False
         self._s_zone = False
 
@@ -263,7 +272,7 @@ class MotionNode(Node):
             if self._target_stamp is not None else float("inf")
         )
         if path_age > PATH_MEMORY_TIMEOUT_S and target_age > TARGET_TIMEOUT_S:
-            self._publish_motor(SPEED_STOP, 0.0)
+            self._lane_lost_recover()
             return
 
         if self._path_xs is None or self._path_xs.size < 2:
@@ -328,10 +337,11 @@ class MotionNode(Node):
             self._straight_ticks += 1
         if self._straight_ticks < STRAIGHT_CONFIRM_TICKS:
             speed = min(speed, SPEED_CURVE_BASE)
-        if self._s_zone:   # S자 구간은 중간에 직선이 잠깐 나와도 끝까지 감속 유지
+        if self._s_zone:
             speed = min(speed, S_CURVE_SPEED)
         if self._cone_mode:
             speed = CONE_SPEED_FIXED
+        self._last_speed = float(speed)
         self._publish_motor(speed, angle)
 
     @staticmethod
@@ -410,8 +420,12 @@ class MotionNode(Node):
             focus_x = self._manual_lookahead
         elif self._ot_speed_cap > 0.0:
             focus_x = OT_STEER_FOCUS_X
+        elif self._s_zone:
+            focus_x = S_STEER_FOCUS_X   # S자 전용
         else:
-            focus_x = STEER_FOCUS_X
+            # 속도비례 lookahead — 빠를수록 멀리 봐서 위빙 방지
+            focus_x = float(np.clip(STEER_FOCUS_BASE + STEER_FOCUS_K * self._last_speed,
+                                    STEER_FOCUS_MIN, STEER_FOCUS_MAX))
         weights = np.exp(-((focus - focus_x) / STEER_FOCUS_SIGMA) ** 2)
         angle = float(np.average(sample_angles, weights=weights))
         return float(np.clip(angle, ANGLE_MIN, ANGLE_MAX))
@@ -437,6 +451,15 @@ class MotionNode(Node):
         angle = float(np.clip(self._prev_angle + step, ANGLE_MIN, ANGLE_MAX))
         self._prev_angle = angle
         return angle
+
+    def _lane_lost_recover(self):
+        # 경로 소실 → 직전 조향 방향으로 최대조향, 느린 속도로 (경로 다시 잡힐 때까지)
+        if abs(self._prev_angle) < LANE_LOST_MIN_ANGLE:
+            rec_angle = self._prev_angle   # 거의 직진이었으면 천천히 직진
+        else:
+            rec_angle = math.copysign(ANGLE_MAX, self._prev_angle)
+        self._prev_angle = rec_angle
+        self._publish_motor(LANE_LOST_SPEED, rec_angle)
 
     @staticmethod
     def _steer_gain_ratio(xs, ys, rel_s=None, distance_m=STEER_GAIN_DISTANCE_M):

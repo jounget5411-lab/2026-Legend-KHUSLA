@@ -47,7 +47,7 @@ class YoloLaneNode(Node):
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("device", "cuda")
-        self.declare_parameter("centerline", True)   # False=raw 마스크 점구름(디버그)
+        self.declare_parameter("centerline", False)  # 기본 raw 마스크 점구름(전체). True=0.18m 요약
 
         model_path = str(self.get_parameter("model_path").value)
         self._conf = float(self.get_parameter("conf").value)
@@ -95,9 +95,7 @@ class YoloLaneNode(Node):
             cls = r.boxes.cls.cpu().numpy().astype(int)
             masks = r.masks.data.cpu().numpy()   # (N, Hm, Wm)
 
-            for seg_cls, z_id in ((SEG_MID, CLS_YELLOW_MID),
-                                  (SEG_LANE, CLS_WHITE_LANE),
-                                  (SEG_CHILD_LANE, 2)):
+            for seg_cls, z_id in ((SEG_MID, CLS_YELLOW_MID),):
                 sel = np.where(cls == seg_cls)[0]
                 if sel.size == 0:
                     continue

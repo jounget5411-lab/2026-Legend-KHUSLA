@@ -103,7 +103,9 @@ STOP_HEADING_TARGET = 0.0         # 정지선 있는 직선 구간 heading (도)
 STOP_HEADING_TOL = 10.0           # ±허용 범위 (도) — 이 밖이면 STOP 무시
 S_ZONE_HEADING_LO = 10.0
 S_ZONE_HEADING_HI = 170.0
-S_ZONE_BLOCK_TICKS = 60          # CONE→LANE 직후 3초(20Hz) S존 오인 차단
+PURE_DRIVE_MODE = False           # True면 LANE에서 특수동작 전부 무시(순수주행 테스트)
+IGNORE_PEDESTRIAN = False         # 보행자 감지 정상 동작 (사람 나오면 정지)
+S_ZONE_BLOCK_TICKS = 160         # CONE→LANE 직후 8초(20Hz) S존 오인 차단
 CORNER_BOOST_WINDOW_TICKS = 400   # CHILD 종료 후 이 시간(20s) 동안 코너 부스트
 
 SC_TURN_R = 2.5                   # 강제 좌회전 호 반경 (m)
@@ -122,7 +124,7 @@ LEFT_SIGNAL_DEBOUNCE_TICKS = 2      # LEFT 신호 최소 검출 회수 (디바�
 PED_X_MAX = 8.0             # 전방 이 거리 이내
 PED_ROAD_HALF_WIDTH = 1.2   # center_path 기준 ± 이 폭 (1.75에서 축소, 도로 경계 오인식 방지)
 PED_MIN_STOP_TICKS = 44     # 정지 시간 (2.2초, 20Hz)
-PED_COOLDOWN_TICKS = 400    # 한번 감지 후 20초간 재감지 안 함 (20Hz)
+PED_COOLDOWN_TICKS = 600    # 한번 감지 후 30초간 재감지 안 함 (20Hz)
 PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
 PED_CAR_SPREAD = 1.5        # 클러스터 간 거리 이 이내면 밀집 (차)
 
@@ -150,9 +152,9 @@ OT_LANE_TO_2ND_TICKS = 100       # 2차선 이동 시간 (5초)
 OT_CAR_PASSED_DELAY_TICKS = 40   # 차 지나간 후 대기 (2초)
 OT_RETURN_TICKS = 60             # 1차선 복귀 시간 (3초 → MERGE)
 OT_LEFT_LIDAR_ANGLE = math.pi / 2   # 왼쪽 90도 (9시)
-OT_LEFT_LIDAR_HALF = 0.15         # ±각도 범위 (rad, ~8도)
+OT_LEFT_LIDAR_HALF = 0.0175        # ±각도 범위 (rad, ±1도)
 OT_LEFT_LIDAR_R_MIN = 0.5         # 왼쪽 감지 최소 거리 (m)
-OT_LEFT_LIDAR_R_MAX = 3.0         # 왼쪽 감지 최대 거리 (m)
+OT_LEFT_LIDAR_R_MAX = 3.2         # 왼쪽 감지 최대 거리 (m)
 OT_RIGHT_LIDAR_ANGLE = math.radians(-88.0)  # 오른쪽 88도
 OT_RIGHT_LIDAR_HALF = math.radians(2.0)    # ±2도 (-90~-86도 커버)
 OT_RIGHT_LIDAR_R_MIN = 0.01       # 오른쪽 감지 최소 거리 (m)
@@ -164,10 +166,10 @@ OT_X_BIN_SIZE = 0.5
 OT_COOLDOWN_TICKS = 400          # 추월 후 20초 재트리거 방지
 # ── 추월 재설계 (S자 끝 트리거 + 노란선 기준 offset 주행) 튜닝 상수 ──
 OT_TRIGGER_HEADING = 140.0       # S자 후반에서 미리 추월 진입(150→140, 더 당김)
-OT_LANE2_OFFSET = -1.3           # 2차선 = 노란선 기준 오른쪽 1.3m (Y 좌+ 이므로 음수)
-OT_LANE1_OFFSET = 1.0            # 1차선 진입 초기 목표 = 노란선 기준 왼쪽 1.0m
-OT_LANE1_REACH = 0.8             # 측정 좌측 오프셋이 이값 도달하면 안쪽 정착
-OT_LANE1_SETTLE = 0.6            # 도달 후 정착 오프셋 (mid 기준 좌 0.6m)
+OT_LANE2_OFFSET = -0.75          # 2차선 = 노란선 기준 오른쪽 0.75m (Y 좌+ 이므로 음수)
+OT_LANE1_OFFSET = 0.9            # 1차선 목표 = 노란선 기준 왼쪽 0.9m
+OT_LANE1_REACH = 0.5             # 측정 좌측 오프셋이 이값 도달하면 안쪽 정착
+OT_LANE1_SETTLE = 0.0            # 정착 = 목표와 동일(좌 0.9m)
 OT_OFFSET_PROBE_X = 1.0          # 현재 오프셋 측정 지점 (m, lidar_frame x)
 OT_PASS_DELAY_TICKS = 0          # 왼쪽 차 사라짐 확정 직후 바로 1차선 변경
 OT_FRONT_GAP_MIN = 0.0           # 1차선 진입 전 정면 이격(m). 0=비활성(시간만으로 컷인)
@@ -179,7 +181,7 @@ OT_LANE1_MAX_TICKS = 400         # child zone 미감지 fallback (20초)
 OT_LANE2_SPEED = 10.0            # 2차선 단계 속도 a (너무 느려 타이밍 안나옴; 8→10)
 OT_LANE1_SPEED = 16.0            # 1차선 단계 속도 (14→16, 더 상향)
 OT_LANE2_MIN_TICKS = 20          # 2차선 진입 후 최소 안착(1초) — 그 전엔 옆차 감지 무시
-OT_LEFT_ON_TICKS = 4             # 왼쪽 차 '감지' 디바운스(연속 N틱)
+OT_LEFT_ON_TICKS = 20            # 왼쪽 차 '감지' 디바운스(연속 N틱) — 1.0s(@20Hz)
 OT_LEFT_OFF_TICKS = 6            # 왼쪽 차 '사라짐' 디바운스(연속 N틱)
 
 BLACK_CAR_CLS_ID = 0
@@ -470,13 +472,15 @@ class PathPlannerNode(Node):
                 self._police_seen_ago += 1
             if self._start_grace_ticks > 0:
                 self._start_grace_ticks -= 1
-            self._tick_child_zone()
-            self._check_pedestrian()
-            if self._start_grace_ticks <= 0:
-                if self._check_red_stop(stamp):
-                    return
-                self._check_shortcut()
-                self._check_overtake()   # S자 끝(heading≈180) → 추월 진입
+            if not PURE_DRIVE_MODE:
+                self._tick_child_zone()
+                if not IGNORE_PEDESTRIAN:
+                    self._check_pedestrian()
+                if self._start_grace_ticks <= 0:
+                    if self._check_red_stop(stamp):
+                        return
+                    self._check_shortcut()
+                    self._check_overtake()   # S자 끝(heading≈180) → 추월 진입
             if self.phase == "LANE":
                 self._lane_offset = self._manual_offset if self._manual_hold > 0 else 0.0
             self._tick_lane(stamp)
@@ -1039,9 +1043,9 @@ class PathPlannerNode(Node):
             self._ot_left_off = 0
             self.get_logger().info("OT: 왼쪽 차 옆(확정)")
         elif self._ot_tick >= OT_LANE2_MAX_TICKS:
-            self._ot_sub = "LANE1_PASSED"
-            self._ot_tick = 0
-            self.get_logger().info("OT: 왼쪽 차 미감지 fallback")
+            # 왼쪽 차 끝내 미감지 → 거짓 추월판정 대신 추월 취소(LANE 복귀)
+            self.get_logger().info("OT: 왼쪽 차 미감지 → 추월 취소")
+            self._exit_overtake()
 
     def _tick_ot_lane1_beside(self):
         """1차선 차가 옆에 있는 동안 2차선 유지. '확실히' 사라지면(지나치면) 대기."""
@@ -1072,9 +1076,11 @@ class PathPlannerNode(Node):
             ego_off = -float(np.polyval(self._lane_center_coef, OT_OFFSET_PROBE_X))
         if not self._ot_lane1_reached and ego_off >= OT_LANE1_REACH:
             self._ot_lane1_reached = True
-            self.get_logger().info("OT: 1차선 도달 → 좌 0.7 정착")
+            self.get_logger().info(f"OT: 1차선 도달 → 좌 {OT_LANE1_SETTLE} 정착")
         self._lane_offset = OT_LANE1_SETTLE if self._ot_lane1_reached else OT_LANE1_OFFSET
-        if self._child_zone or self._ot_tick >= OT_LANE1_MAX_TICKS:
+        # child_zone가 컷인 '도중'에 떠도 바로 abort하지 않고 1차선 도달(_ot_lane1_reached) 후에만
+        # 종료 → 횡이동 방향 급반전(추월↔child 충돌/버벅) 방지. 미도달이면 MAX_TICKS로만 탈출.
+        if (self._child_zone and self._ot_lane1_reached) or self._ot_tick >= OT_LANE1_MAX_TICKS:
             self.get_logger().info("OVERTAKE 완료 → LANE")
             self._exit_overtake()
 
