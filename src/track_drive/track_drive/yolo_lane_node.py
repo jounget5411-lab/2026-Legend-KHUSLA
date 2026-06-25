@@ -35,8 +35,8 @@ SEG_MID = 8         # 중앙선 → z=8
 SEG_LANE = 6        # 외곽 흰 실선 → z=6
 SEG_CHILD_LANE = 2  # 어린이보호 노란 실선 → z=2
 
-DEFAULT_MODEL = os.path.join(
-    os.path.expanduser("~"), "xycar_ws", "src", "track_drive", "friend", "best.pt")
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # .../track_drive
+DEFAULT_MODEL = os.path.join(_PKG_ROOT, "config", "lane.pt")
 
 
 class YoloLaneNode(Node):
@@ -47,7 +47,7 @@ class YoloLaneNode(Node):
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("device", "cuda")
-        self.declare_parameter("centerline", False)  # 기본 raw 마스크 점구름(전체). True=0.18m 요약
+        self.declare_parameter("centerline", True)   # 기본 0.18m 요약 centerline. False=raw 마스크 점구름(전체)
 
         model_path = str(self.get_parameter("model_path").value)
         self._conf = float(self.get_parameter("conf").value)

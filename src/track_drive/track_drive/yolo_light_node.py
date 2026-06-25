@@ -21,8 +21,8 @@ GREEN_CLS = 0
 LEFT_CLS = 1
 RED_CLS = 2
 
-DEFAULT_MODEL_PATH = os.path.join(
-    os.path.expanduser("~"), "xycar_ws", "src", "track_drive", "friend", "legend_best.pt")
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # .../track_drive
+DEFAULT_MODEL_PATH = os.path.join(_PKG_ROOT, "config", "light.pt")
 
 
 class YoloLightNode(Node):

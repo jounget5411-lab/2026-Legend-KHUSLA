@@ -164,7 +164,7 @@ class YoloLaneViewer(Node):
         for x, y in self._scan:
             px, py = _to_px(x, y)
             if 0 <= px < IMG_W and 0 <= py < IMG_H:
-                cv2.circle(img, (px, py), 1, (90, 90, 90), -1)
+                cv2.circle(img, (px, py), 2, (190, 190, 190), -1)
 
         # 추월 왼쪽 감지 영역 (path_planner OT_LEFT_LIDAR_*: 90도±8.5도, 0.5~3.0m)
         for ang in (math.pi / 2 - 0.15, math.pi / 2 + 0.15):

@@ -64,12 +64,12 @@ LEFT_TURN_ANGLE = -100.0          # 좌회전 하드코딩 조향각
 LEFT_TURN_SPEED = 10.0            # 좌회전 속도
 LEFT_TURN1_TICKS = 50             # TURNING_1 지속 (50 ticks = 2.5초)
 LEFT_TURN2_TICKS = 48             # TURNING_2 지속 (48 ticks = 2.4초 @20Hz)
-CHILD_ZONE_SPEED = 15.0            # 어린이 보호구역 속도 제한 (→15.5)
+CHILD_ZONE_SPEED = 22.0            # 어린이 보호구역 속도 제한 (→15.5)
 SLOW_AFTER_TURN_SPEED = 5.0       # 좌회전 직후 감속
 SLOW_AFTER_TURN_TICKS = 60        # 3초 (20Hz)
 SLOW_MERGE_SPEED = 7.0            # (미사용) 과거 추월 합류 감속
-SHORTCUT_SPEED = 14.0            # 지름길(SHORTCUT) 직선 속도 (기본 22보다 낮춤, →15)
-CONE_SPEED_FIXED = 15.0           # 라바콘 구간 고정 속도 (15→16)
+SHORTCUT_SPEED = 15.0            # 지름길(SHORTCUT) 직선 속도 (기본 22보다 낮춤, →15)
+CONE_SPEED_FIXED = 16.0           # 라바콘 구간 고정 속도 (15→16)
 CONE_STEER_GAIN = 1.12            # 라바콘 구간 조향 보정
 # 응답 빠르게 하려고 alpha up (한 프레임에 변화의 75% 반영).
 ANGLE_SMOOTH_ALPHA = 0.55
@@ -91,9 +91,9 @@ def _map_kmh_to_speed_cmd(kmh):
     return float(np.clip(cmd, 0.0, SPEED_CMD_MAX))
 
 
-SPEED_DEFAULT = 18.0
-SPEED_CURVE_BASE = 18.0           # 일반 코너 (S자 아닌)
-S_CURVE_SPEED = 7.0               # S자 코너 cap
+SPEED_DEFAULT = 24.0
+SPEED_CURVE_BASE = 20.0           # 일반 코너 (S자 아닌)
+S_CURVE_SPEED = 8.0               # S자 코너 cap
 SPEED_MIN = 3.0
 SPEED_STOP = 0.0
 SPEED_SLOW_START_DEG = 12.0

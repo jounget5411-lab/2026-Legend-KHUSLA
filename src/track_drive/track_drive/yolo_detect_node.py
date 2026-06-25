@@ -54,8 +54,8 @@ EVENT_CLASS_IDS = {6, 10, 12, 13, 15}
 IGNORE_CLASS_IDS = {2, 9, 11}  # CHILD_LANE, LANE, MID
 
 # 기본 모델 경로 — 워크스페이스 src 절대경로
-DEFAULT_MODEL_PATH = os.path.join(
-    os.path.expanduser("~"), "xycar_ws", "src", "track_drive", "config", "best.pt")
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # .../track_drive
+DEFAULT_MODEL_PATH = os.path.join(_PKG_ROOT, "config", "best.pt")
 
 # ======================== ROS 노드 ========================
 

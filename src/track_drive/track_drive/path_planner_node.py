@@ -97,10 +97,13 @@ EVT_NAMES = {
 # TURNING_1 → FOLLOW (지름길 차선 추종, _tick_lane 재사용)
 # FOLLOW → CROSSROAD 가까움 OR 15s timeout → TURNING_2 (좌측 호, 2초) → LANE 복귀
 
-STOP_V_THRESHOLD = 320.0          # 480p 기준, 정지선 bbox bottom v가 이 이상이면 가까움
+STOP_V_THRESHOLD = 312.0          # 480p 기준, 정지선 bbox bottom v가 이 이상이면 가까움
 CROSS_V_THRESHOLD = 278.0         # 480p 기준, CROSSROAD_OUT bbox bottom v 임계 (작을수록 멀리서 트리거)
 STOP_HEADING_TARGET = 0.0         # 정지선 있는 직선 구간 heading (도)
 STOP_HEADING_TOL = 10.0           # ±허용 범위 (도) — 이 밖이면 STOP 무시
+STOP_BLOCK_270_DEG = 270.0        # heading(0~360 환산)이 이 부근을 지나면
+STOP_BLOCK_270_TOL = 5.0         # ±허용(도)
+STOP_BLOCK_270_TICKS = 60         # 이후 3초(20Hz)간 STOP 감지 차단
 S_ZONE_HEADING_LO = 10.0
 S_ZONE_HEADING_HI = 170.0
 PURE_DRIVE_MODE = False           # True면 LANE에서 특수동작 전부 무시(순수주행 테스트)
@@ -166,9 +169,9 @@ OT_X_BIN_SIZE = 0.5
 OT_COOLDOWN_TICKS = 400          # 추월 후 20초 재트리거 방지
 # ── 추월 재설계 (S자 끝 트리거 + 노란선 기준 offset 주행) 튜닝 상수 ──
 OT_TRIGGER_HEADING = 140.0       # S자 후반에서 미리 추월 진입(150→140, 더 당김)
-OT_LANE2_OFFSET = -0.75          # 2차선 = 노란선 기준 오른쪽 0.75m (Y 좌+ 이므로 음수)
-OT_LANE1_OFFSET = 0.9            # 1차선 목표 = 노란선 기준 왼쪽 0.9m
-OT_LANE1_REACH = 0.5             # 측정 좌측 오프셋이 이값 도달하면 안쪽 정착
+OT_LANE2_OFFSET = -1.07           # 2차선 = 노란선 기준 오른쪽 1.0m (Y 좌+ 이므로 음수)
+OT_LANE1_OFFSET = 1.1            # 1차선 목표 = 노란선 기준 왼쪽 1.0m
+OT_LANE1_REACH = 0.3             # 측정 좌측 오프셋이 이값 도달하면 안쪽 정착
 OT_LANE1_SETTLE = 0.0            # 정착 = 목표와 동일(좌 0.9m)
 OT_OFFSET_PROBE_X = 1.0          # 현재 오프셋 측정 지점 (m, lidar_frame x)
 OT_PASS_DELAY_TICKS = 0          # 왼쪽 차 사라짐 확정 직후 바로 1차선 변경
@@ -244,6 +247,7 @@ class PathPlannerNode(Node):
         self._sc_cooldown = 0            # 재트리거 차단 카운터
         self._left_signal_hits = 0       # LEFT 디바운싱용 누적 카운트
         self._red_stopping = False       # RED + 정지선 정지 중 플래그 (로그 중복 방지)
+        self._stop_block_270 = 0         # 270도 부근 통과 후 STOP 차단 타이머
         self._police_seen_ago = 999      # POLICE 마지막 감지 후 틱 수
 
         # 어린이 보호구역
@@ -497,6 +501,15 @@ class PathPlannerNode(Node):
         # 로그
         if self._manual_hold > 0:
             self._manual_hold -= 1
+        # heading 270도(0~360 환산) 부근 통과 → 이후 STOP_BLOCK_270_TICKS 동안 STOP 차단
+        _h360 = self._heading_deg % 360.0
+        _d270 = abs(_h360 - STOP_BLOCK_270_DEG)
+        if _d270 > 180.0:
+            _d270 = 360.0 - _d270
+        if _d270 <= STOP_BLOCK_270_TOL:
+            self._stop_block_270 = STOP_BLOCK_270_TICKS
+        elif self._stop_block_270 > 0:
+            self._stop_block_270 -= 1
         raw_szone = (S_ZONE_HEADING_LO <= self._heading_deg <= S_ZONE_HEADING_HI)
         if self._s_zone_block > 0:
             self._s_zone_block -= 1
@@ -839,6 +852,8 @@ class PathPlannerNode(Node):
         if (self._stop_max_v is None or self._stop_max_v < STOP_V_THRESHOLD
                 or not self._heading_ok_for_stop()):
             return False
+        if self._stop_block_270 > 0:
+            return False  # 270도 부근 통과 후 3초간 STOP 차단
         if self._light_green and police_recent:
             return False  # POLICE 교차로 + 초록불 → 그냥 통과
         self.get_logger().info("STOP")
