@@ -41,6 +41,7 @@ setup(
             'steer_calib = track_drive.steer_calib_node:main',
             'imu_logger = track_drive.imu_logger_node:main',
             'ot_tune = track_drive.ot_tune_node:main',
+            'yolo_light = track_drive.yolo_light_node:main',
             'yolo_print = track_drive.yolo_print_node:main',
         ],
     },

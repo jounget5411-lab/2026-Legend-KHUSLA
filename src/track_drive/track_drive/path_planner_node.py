@@ -31,7 +31,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
 from sensor_msgs.msg import Imu, LaserScan
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 
 # LANE 모드: 친구 plan() + 헬퍼 (lane_planner.py = 친구 path_planner_node.py 원본)
 from .lane_planner import plan as lane_plan
@@ -304,9 +304,11 @@ class PathPlannerNode(Node):
         self.create_subscription(Imu, "/imu", self._on_imu, qos_profile_sensor_data)
         self.create_subscription(LaserScan, "/scan", self._on_scan, qos_profile_sensor_data)
         self.create_subscription(Float32, "/manual_offset", self._on_manual_offset, 10)
+        self.create_subscription(String, "/detect/traffic_light", self._on_traffic_light, 10)
         # 수동 좌회전 트리거 (모델 LEFT 미인식 임시 대체)
         self.create_subscription(Bool, "/sc_go", self._on_sc_go, 10)
         self._sc_go_flag = False
+        self._light_green = False        # legend_best.pt 신호등 green 상태
 
         # 발행
         self._pub_center = self.create_publisher(PoseArray, "/center_path", 10)
@@ -406,6 +408,9 @@ class PathPlannerNode(Node):
     def _on_manual_offset(self, msg):
         self._manual_offset = float(msg.data)
         self._manual_hold = 10   # 0.5초(20Hz) 유지 — 끊기면 자동 해제
+
+    def _on_traffic_light(self, msg):
+        self._light_green = (msg.data == "GREEN")
 
     def _on_scan(self, msg: LaserScan):
         """왼쪽/오른쪽 90도 방향 라이다 감지 (추월 시 옆 차량 확인)."""
@@ -550,8 +555,8 @@ class PathPlannerNode(Node):
                 self.get_logger().info("GREEN")
             return
 
-        if GREEN_CLS_ID in self._events:
-            self._wait_green_ticks = 72  # 3.6초 (20Hz)
+        if self._light_green:
+            self._wait_green_ticks = 6   # green 확인 후 약 0.3초 뒤 출발(legend 모델, 주황오인 없음 → 3.6초 대기 제거)
 
             self.get_logger().info("GREEN")
 
@@ -806,12 +811,12 @@ class PathPlannerNode(Node):
         police_recent = self._police_seen_ago <= 10  # 0.5초 이내 POLICE
         # 이미 정지 중이면 GREEN + POLICE 최근으로 해제
         if self._red_stopping:
-            if GREEN_CLS_ID in self._events and police_recent:
+            if self._light_green and police_recent:
                 self._pub_estop.publish(Bool(data=False))
                 self.get_logger().info("GO")
                 self._red_stopping = False
                 return False
-            if ((GREEN_CLS_ID in self._events or LEFT_SIGN_CLS_ID in self._events)
+            if ((self._light_green or LEFT_SIGN_CLS_ID in self._events)
                     and not police_recent):
                 # GREEN 또는 LEFT 화살표 + POLICE 아님 → SHORTCUT.WAITING 진입
                 # (직진 GREEN만 기다리다 LEFT 화살표 타이밍 놓쳐 한 바퀴 도는 것 방지)
@@ -830,7 +835,7 @@ class PathPlannerNode(Node):
         if (self._stop_max_v is None or self._stop_max_v < STOP_V_THRESHOLD
                 or not self._heading_ok_for_stop()):
             return False
-        if GREEN_CLS_ID in self._events and police_recent:
+        if self._light_green and police_recent:
             return False  # POLICE 교차로 + 초록불 → 그냥 통과
         self.get_logger().info("STOP")
         self._red_stopping = True
