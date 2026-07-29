@@ -28,9 +28,6 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # 원본 스켈레톤 (벤더 도구 — 유지)
-            'track_drive = track_drive.track_drive:main',
-            'calib_collect = track_drive.calib_collect:main',
             # 본선 주행 파이프라인 (실차)
             'yolo = track_drive.yolo_node:main',
             'path_planner = track_drive.path_planner_node:main',
@@ -39,7 +36,8 @@ setup(
             'teleop = track_drive.teleop_node:main',
             # 디버그 뷰어
             'yolo_lane_viewer = track_drive.yolo_lane_viewer_node:main',
-            # 구 예선 엔트리(yolo_lane/yolo_detect/yolo_light/integration) 제거 — 파일은 보존
+            # 예선 유래 파일은 lane_planner.py(폴리핏 코어, planner가 import)와
+            # yolo_lane_viewer_node.py(뷰어)만 유지 — 나머지는 예선/ 폴더 참조
         ],
     },
 )
