@@ -55,7 +55,7 @@ class YoloLaneViewer(Node):
         self._target = None
         self._scan = []        # (x,y) 라이다 점 (lidar_frame)
 
-        self.create_subscription(PoseArray, "/fused/lane", self._on_lane, 10)
+        self.create_subscription(PoseArray, "/detect/lane", self._on_lane, 10)
         self.create_subscription(LaserScan, "/scan", self._on_scan, qos_profile_sensor_data)
         self.create_subscription(PoseArray, "/center_path", self._on_center, 10)
         self.create_subscription(PoseArray, "/lane_left", self._on_left, 10)

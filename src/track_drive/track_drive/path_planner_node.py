@@ -1,194 +1,60 @@
 #!/usr/bin/env python3
+"""통합 경로계획(실차) — phase 머신 보존 + 배선·기준 수술판.
+
+역할: WAIT→LANE(→CONE/PEDESTRIAN/SHORTCUT) phase 머신으로 /center_path·/target을
+  만들고, 속도·조향 정책은 /drive_cmd 20Hz 스냅샷 하나로 motion에 전달한다.
+입력: /detect/lane(PoseArray, z=cls), /detect/objects(PoseArray, u/v/cls),
+  /detect/traffic_light(String), /detect/lane_quality(Float32),
+  /scan(LaserScan, BEST_EFFORT), /car_state(Float32MultiArray),
+  /corridor_path(PoseArray, 외부팀 콘 통로), /manual_go(Bool).
+출력: /center_path /target /lane_left /lane_right (예선 형식 그대로),
+  /drive_cmd (Float32MultiArray — lib/drive_cmd.py 레이아웃).
+예선 대비 변경점:
+  - Bool 라치류(/emergency_stop /child_zone /cone_mode /shortcut_slow /corner_boost
+    /overtake_speed /left_turn1·2 /s_zone) 전부 제거 → /drive_cmd 스냅샷으로 대체.
+  - WAIT→LANE 직행(무조건 CONE 진입 제거). CONE은 LANE 중 라이다 클러스터 감지 기반
+    진입, miss '연속 스캔 수'로 종료. /corridor_path 신선 시 기준선 우선 사용.
+  - heading 게이트 전부 IMU 절대각 → /car_state yaw_rel(출발 기준각, wrap-safe) 기준.
+  - SHORTCUT TURNING은 시간 틱 대신 BLOCK(block_id 원샷 + 목표 |Δyaw| 도달 판정).
+    _shortcut_done 평생 1회 래치. POLICE/GREEN-정지-후-공략/종료 시 child 강제 제거.
+  - plan()엔 빈 장애물(내부 0.8m 시프트 비활성) → path_gen 오프셋 최적화가 회피 전담.
+  - OVERTAKE는 스텁(인터페이스만). /sc_go 제거 → /manual_go 실소비.
 """
-통합 경로계획 — 상태머신 WAIT → CONE → LANE.
-
-상태:
-  WAIT: 정지. YOLO 초록불(GREEN=5) 감지 시 CONE으로 전환.
-  CONE: 라바콘 주행. 왼쪽 콘 줄 2차 피팅 + 2.2m 오프셋 = 중앙선.
-        콘 miss 30회(3초) 연속 시 LANE으로 전환.
-  LANE: 차선 주행. 노란 중앙선(cls_id=8) 기반 2차 피팅.
-        lane_planner.py의 plan() 함수 — 친구(sm) 원본 그대로.
-
-구독:
-  /fused/obstacles  — 라이다 장애물 (CONE 모드용)
-  /fused/lane       — 차선 점 (LANE 모드용, z=cls_id: 8=노란, 6=흰)
-  /detect/events_raw — YOLO 이벤트 (WAIT에서 초록불 감지)
-
-발행:
-  /center_path  — 중앙 경로 (PoseArray, motion이 추종)
-  /target       — 목표점 (PointStamped)
-  /lane_left    — 좌측 경계 (시각화용)
-  /lane_right   — 우측 경계 (시각화용)
-  /lane_fits    — 피팅 결과 (LANE 모드 디버그용)
-"""
-
-import numpy as np
 
 import math
+
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Pose, PoseArray, PointStamped
-from sensor_msgs.msg import Imu, LaserScan
-from std_msgs.msg import Bool, Float32, String
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool, Empty, Float32, Float32MultiArray, String
 
-# LANE 모드: 친구 plan() + 헬퍼 (lane_planner.py = 친구 path_planner_node.py 원본)
+# LANE 모드: 친구 plan() 재사용 (lane_planner.py는 수정하지 않는다)
 from .lane_planner import plan as lane_plan
 from .lane_planner import (
-    YELLOW_CLS_IDS, YELLOW_DASH_CLS_IDS, WHITE_CLS_IDS, PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
-    _polyval_clipped, _sample_xs, _yellow_inlier_xs, _yellow_inlier_ys,
+    YELLOW_CLS_IDS, YELLOW_DASH_CLS_IDS, WHITE_CLS_IDS,
+    PLAN_HZ, TARGET_X, TARGET_Y_LIMIT,
 )
-
-# ======================== CONE 상수 ========================
-# 라바콘 구간: 라이다 /fused/obstacles에서 왼쪽 콘 줄을 피팅해
-# 트랙 절반(2.2m) 오프셋으로 중앙선을 만든다.
-
-CONE_X_MIN = 0.3           # 전방 ROI 최소 (m)
-CONE_X_MAX = 10.0          # 전방 ROI 최대 (m)
-CONE_Y_MIN = -6.0          # 좌우 ROI (m)
-CONE_Y_MAX = 6.0
-TRACK_WIDTH = 4.4           # 실측 트랙 폭 (m)
-TRACK_HALF_WIDTH = TRACK_WIDTH / 2.0
-
-CONE_FIT_MIN_POINTS = 2
-CONE_FIT_MIN_X_SPAN = 0.8
-CONE_FIT_CURVE_MAX = 1.5
-CONE_FIT_SLOPE_MAX = 3.0
-CONE_LEFT_ACCEPT_DIST = 1.5
-CONE_FIT_SMOOTH_ALPHA = 0.20
-CONE_FIT_MAX_MISS = 39
-
-CONE_SAMPLE_X_START = 0.5
-CONE_SAMPLE_X_END = 6.0
-CONE_SAMPLE_N = 25
-
-CONE_TO_LANE_MISS = 40
-CONE_GRACE_TICKS = 20          # 2초 (20Hz)
+from .lib.drive_cmd import Owner, SteerProfile, encode_drive_cmd, decode_car_state
+from .lib.cluster import cluster_scan, ClusterTracker
+from .lib.path_gen import PathGen
 
 # ======================== YOLO 클래스 ID (best.pt 학습 시점 기준) ========================
-# 0=BLACK_CAR  1=CHILD_END  2=CHILD_LANE  3=CHILD_START
-# 4=CROSSROAD_OUT  5=GOAL  6=GREEN  7=GREEN_CAR  8=HUMAN
-# 9=LANE  10=LEFT  11=MID  12=POLICE  13=RED  14=STOP  15=YELLOW
+# 0=BLACK_CAR 1=CHILD_END 2=CHILD_LANE 3=CHILD_START 4=CROSSROAD_OUT 5=GOAL
+# 6=GREEN 7=GREEN_CAR 8=HUMAN 9=LANE 10=LEFT 11=MID 12=POLICE 13=RED 14=STOP 15=YELLOW
+# (신호등 GREEN/RED는 /detect/traffic_light 문자열로 받는다 — 여기선 ID 불필요)
 
-# /detect/events_raw 에서 보는 플래그류
-GREEN_CLS_ID = 6
-RED_CLS_ID = 13
-YELLOW_LIGHT_CLS_ID = 15
 LEFT_SIGN_CLS_ID = 10
-CHILD_START_CLS_ID = 3
-CHILD_END_CLS_ID = 1
-POLICE_CLS_ID = 12
-
-# /detect/road_pixels 에서 보는 위치 의미 있는 객체 (bbox bottom v = 거리 proxy)
 STOP_CLS_ID = 14
 CROSSROAD_CLS_ID = 4
-GOAL_CLS_ID = 5
-HUMAN_CLS_ID = 8
-
-EVT_NAMES = {
-    6: "GREEN", 13: "RED", 15: "YELLOW", 10: "LEFT",
-    12: "POLICE", 3: "CHILD_START", 1: "CHILD_END",
-}
-
-# ======================== SHORTCUT (지름길 좌회전) 상수 ========================
-# 진입: 정지선 충분히 가까움 + POLICE 없음 → WAITING (정지, LEFT 대기)
-# WAITING → LEFT 신호 검출 → TURNING_1 (좌측 호 강제, 2초)
-# TURNING_1 → FOLLOW (지름길 차선 추종, _tick_lane 재사용)
-# FOLLOW → CROSSROAD 가까움 OR 15s timeout → TURNING_2 (좌측 호, 2초) → LANE 복귀
-
-STOP_V_THRESHOLD = 312.0          # 480p 기준, 정지선 bbox bottom v가 이 이상이면 가까움
-CROSS_V_THRESHOLD = 278.0         # 480p 기준, CROSSROAD_OUT bbox bottom v 임계 (작을수록 멀리서 트리거)
-STOP_HEADING_TARGET = 0.0         # 정지선 있는 직선 구간 heading (도)
-STOP_HEADING_TOL = 10.0           # ±허용 범위 (도) — 이 밖이면 STOP 무시
-STOP_BLOCK_270_DEG = 270.0        # heading(0~360 환산)이 이 부근을 지나면
-STOP_BLOCK_270_TOL = 5.0         # ±허용(도)
-STOP_BLOCK_270_TICKS = 60         # 이후 3초(20Hz)간 STOP 감지 차단
-S_ZONE_HEADING_LO = 10.0
-S_ZONE_HEADING_HI = 170.0
-PURE_DRIVE_MODE = False           # True면 LANE에서 특수동작 전부 무시(순수주행 테스트)
-IGNORE_PEDESTRIAN = False         # 보행자 감지 정상 동작 (사람 나오면 정지)
-S_ZONE_BLOCK_TICKS = 160         # CONE→LANE 직후 8초(20Hz) S존 오인 차단
-CORNER_BOOST_WINDOW_TICKS = 400   # CHILD 종료 후 이 시간(20s) 동안 코너 부스트
-
-SC_TURN_R = 2.5                   # 강제 좌회전 호 반경 (m)
-SC_TURN_DEG = 120.0               # 호 각도 (90보다 크게 → 실제 90도 정도 꺾임)
-SC_TURN_TICKS = 50                # 강제 좌회전 지속 (50 ticks = 2.5초 @ 20Hz)
-SC_ARC_SAMPLE_N = 15              # 호 샘플 점 개수
-
-SC_FOLLOW_HARD_TIMEOUT_TICKS = 300  # FOLLOW에서 CROSSROAD 못 잡으면 15초 후 강제
-SC_BYPASS_COOLDOWN_TICKS = 80       # POLICE 봤을 때 같은 정지선 재트리거 차단 (4초)
-SC_DONE_COOLDOWN_TICKS = 200        # SHORTCUT 한 번 끝난 후 재진입 차단 (10초)
-
-LEFT_SIGNAL_DEBOUNCE_TICKS = 2      # LEFT 신호 최소 검출 회수 (디바운싱)
-
-# ======================== 사람 감지 (PEDESTRIAN) ========================
-
-PED_X_MAX = 8.0             # 전방 이 거리 이내
-PED_ROAD_HALF_WIDTH = 1.2   # center_path 기준 ± 이 폭 (1.75에서 축소, 도로 경계 오인식 방지)
-PED_MIN_STOP_TICKS = 44     # 정지 시간 (2.2초, 20Hz)
-PED_COOLDOWN_TICKS = 600    # 한번 감지 후 30초간 재감지 안 함 (20Hz)
-PED_CAR_CLUSTER_COUNT = 3   # 도로 안 클러스터 이 이상이면 차 (사람 아님)
-PED_CAR_SPREAD = 1.5        # 클러스터 간 거리 이 이내면 밀집 (차)
-
-# ======================== 어린이 보호구역 (CHILD ZONE) ========================
-
-CHILD_START_V_THR = 200.0        # CHILD_START bbox v 이 이상이면 트리거
-CHILD_END_V_THR = 400.0          # CHILD_END bbox v 이 이상이면 트리거
-CHILD_EXIT_DELAY_TICKS = 60      # END 감지 후 3초 뒤 속도 원복 (20Hz)
-CHILD_ENTER_COOLDOWN_TICKS = 60  # START 후 3초간 END 무시 (오인식 방지)
-CHILD_EXIT_COOLDOWN_TICKS = 200  # END 후 10초간 START 무시 (재진입 방지)
-CHILD_HARD_TIMEOUT_TICKS = 340   # 17초 후 강제 해제 (20Hz)
-
-# ======================== 추월 (OVERTAKE) ========================
-
-OT_CAR_V_THRESHOLD = 250.0       # BLACK_CAR/GREEN_CAR bbox v 이 이상이면 트리거
-OT_HEADING_MIN = 50.0            # 추월 허용 heading 최소 (도)
-OT_HEADING_MAX = 170.0           # 추월 허용 heading 최대 (도)
-OT_YELLOW_RIGHT_OFFSET = -1.5    # 노란선 기준 오른쪽 1.5m (2차선으로 이동)
-OT_WHITE_LEFT_OFFSET = 0.8       # 오른쪽 흰선 기준 왼쪽 0.8m (2차선 주행)
-OT_WHITE_LEFT_PASSING = 5.5      # 왼쪽 감지 후 흰선 기준 왼쪽 5.5m
-OT_YELLOW_LEFT_OFFSET_1 = 2.0    # 왼쪽 사라진 후 노란선 기준 왼쪽 2.0m
-OT_YELLOW_RIGHT_MERGE = -0.5     # 노란선 기준 오른쪽 0.5m (합류)
-OT_MERGE_TICKS = 40              # 합류 주행 시간 (2초)
-OT_LANE_TO_2ND_TICKS = 100       # 2차선 이동 시간 (5초)
-OT_CAR_PASSED_DELAY_TICKS = 40   # 차 지나간 후 대기 (2초)
-OT_RETURN_TICKS = 60             # 1차선 복귀 시간 (3초 → MERGE)
-OT_LEFT_LIDAR_ANGLE = math.pi / 2   # 왼쪽 90도 (9시)
-OT_LEFT_LIDAR_HALF = 0.0175        # ±각도 범위 (rad, ±1도)
-OT_LEFT_LIDAR_R_MIN = 0.5         # 왼쪽 감지 최소 거리 (m)
-OT_LEFT_LIDAR_R_MAX = 3.2         # 왼쪽 감지 최대 거리 (m)
-OT_RIGHT_LIDAR_ANGLE = math.radians(-88.0)  # 오른쪽 88도
-OT_RIGHT_LIDAR_HALF = math.radians(2.0)    # ±2도 (-90~-86도 커버)
-OT_RIGHT_LIDAR_R_MIN = 0.01       # 오른쪽 감지 최소 거리 (m)
-OT_RIGHT_LIDAR_R_MAX = 3.0        # 오른쪽 감지 최대 거리 (m)
-OT_FIT_MIN_POINTS = 5
-OT_OUTLIER_THR = 0.4
-OT_EMA_ALPHA = 0.15
-OT_X_BIN_SIZE = 0.5
-OT_COOLDOWN_TICKS = 400          # 추월 후 20초 재트리거 방지
-# ── 추월 재설계 (S자 끝 트리거 + 노란선 기준 offset 주행) 튜닝 상수 ──
-OT_TRIGGER_HEADING = 140.0       # S자 후반에서 미리 추월 진입(150→140, 더 당김)
-OT_LANE2_OFFSET = -1.07           # 2차선 = 노란선 기준 오른쪽 1.0m (Y 좌+ 이므로 음수)
-OT_LANE1_OFFSET = 1.1            # 1차선 목표 = 노란선 기준 왼쪽 1.0m
-OT_LANE1_REACH = 0.3             # 측정 좌측 오프셋이 이값 도달하면 안쪽 정착
-OT_LANE1_SETTLE = 0.0            # 정착 = 목표와 동일(좌 0.9m)
-OT_OFFSET_PROBE_X = 1.0          # 현재 오프셋 측정 지점 (m, lidar_frame x)
-OT_PASS_DELAY_TICKS = 0          # 왼쪽 차 사라짐 확정 직후 바로 1차선 변경
-OT_FRONT_GAP_MIN = 0.0           # 1차선 진입 전 정면 이격(m). 0=비활성(시간만으로 컷인)
-OT_FRONT_HALF = math.radians(6.0)  # 정면 라이다 콘 반각
-OT_FRONT_R_MIN = 0.3
-OT_FRONT_R_MAX = 8.0
-OT_LANE2_MAX_TICKS = 200         # 왼쪽 차 미감지 fallback (10초)
-OT_LANE1_MAX_TICKS = 400         # child zone 미감지 fallback (20초)
-OT_LANE2_SPEED = 10.0            # 2차선 단계 속도 a (너무 느려 타이밍 안나옴; 8→10)
-OT_LANE1_SPEED = 16.0            # 1차선 단계 속도 (14→16, 더 상향)
-OT_LANE2_MIN_TICKS = 20          # 2차선 진입 후 최소 안착(1초) — 그 전엔 옆차 감지 무시
-OT_LEFT_ON_TICKS = 20            # 왼쪽 차 '감지' 디바운스(연속 N틱) — 1.0s(@20Hz)
-OT_LEFT_OFF_TICKS = 6            # 왼쪽 차 '사라짐' 디바운스(연속 N틱)
-
+CHILD_START_CLS_ID = 3
+CHILD_END_CLS_ID = 1
 BLACK_CAR_CLS_ID = 0
 GREEN_CAR_CLS_ID = 7
+
 
 # ======================== 헬퍼 ========================
 
@@ -204,16 +70,32 @@ def _poses_from_xy(stamp, xs, ys):
     return msg
 
 
-def _make_pose_array(stamp, xs, ys):
-    out = PoseArray()
-    out.header.stamp = stamp
-    out.header.frame_id = "lidar_frame"
-    for x, y in zip(xs, ys):
-        p = Pose()
-        p.position.x = float(x)
-        p.position.y = float(y)
-        out.poses.append(p)
-    return out
+def _circ_diff_deg(a, b):
+    """wrap-safe 원형 차이 a-b (deg) → -180~180."""
+    return (float(a) - float(b) + 180.0) % 360.0 - 180.0
+
+
+# ======================== OVERTAKE 스텁 ========================
+
+class OvertakeStub:
+    """추월 스텁 — 예선 상태머신은 이식하지 않음(본선 재설계 자리).
+
+    인터페이스만 유지:
+      update(front_min_m, left_on, right_on, car_v, car_state) → None | dict
+        None  = 개입 없음 (현재 항상)
+        dict  = {"offset": m(좌+), "speed_cap": 명령단위}
+                활성화되면 planner가 path_gen 기준선 오프셋과
+                drive_cmd.speed_cap에 그대로 반영할 자리.
+    TODO(본선): 전방 저속 차량 감지 — 라이다 트래커 vel_xy(동적 판별) +
+      /detect/objects 차량 클래스(BLACK_CAR/GREEN_CAR) bbox v 트리거,
+      2차선 오프셋 → 측면 창 확인 → 복귀 시퀀스 설계.
+    """
+
+    active = False
+
+    def update(self, front_min_m=float("inf"), left_on=False, right_on=False,
+               car_v=None, car_state=None):
+        return None
 
 
 # ======================== ROS 노드 ========================
@@ -222,60 +104,128 @@ class PathPlannerNode(Node):
     def __init__(self):
         super().__init__("path_planner_node")
 
-        self.phase = "IDLE"  # 시뮬 연결 전
-        self._wait_green_ticks = 0       # WAIT에서 GREEN 감지 후 카운트
-        self._start_grace_ticks = 0      # 출발 후 STOP 무시 타이머 (20초)
+        # ---------------- 파라미터 (tuning.yaml 추출 대상) ----------------
+        # 출발/공통
+        self.declare_parameter("start_confirm_ticks", 6)        # [SIM] 기존 6틱 출발 확인 유지
+        self.declare_parameter("start_grace_sec", 20.0)         # [SIM] 기존 400틱 — 출발 후 정지선/지름길 무시
+        self.declare_parameter("objects_fresh_sec", 0.5)        # /detect/objects 신선도 (v임계 판정 전제)
+        self.declare_parameter("lane_stale_sec", 0.6)           # /detect/lane 신선도 — 초과 시 경로 발행 중단
+        self.declare_parameter("scan_stale_sec", 1.0)           # /scan 신선도 — 초과 시 장애물 무시·CONE miss 계수
+        self.declare_parameter("manual_go_fresh_sec", 2.0)      # /manual_go 유효 시간 (실소비 전 잔류 방지)
+        self.declare_parameter("lane_quality_min", 0.3)         # 이 미만이면 감속 cap
+        self.declare_parameter("low_quality_speed_cap", 7.0)    # [SIM] 차선 품질 저하 시 speed_cap
+        # 클러스터/트래커 (lib/cluster.py)
+        self.declare_parameter("cluster_gap_m", 0.35)           # [SIM] 예선 CLUSTER_GAP 계승
+        self.declare_parameter("cluster_padding", 0.05)         # [SIM] 예선 CLUSTER_PADDING 계승
+        self.declare_parameter("cluster_gap_per_m", 0.05)
+        self.declare_parameter("cluster_min_pts", 2)
+        self.declare_parameter("cluster_r_min", 0.05)
+        self.declare_parameter("cluster_r_max", 8.0)
+        self.declare_parameter("tracker_k", 2)                  # k-of-n 확정 관측
+        self.declare_parameter("tracker_n", 3)
+        self.declare_parameter("tracker_match_dist", 0.5)
+        # 회피 (lib/path_gen.py)
+        self.declare_parameter("avoid_clear_margin", 0.45)      # 차폭/2 + 여유 (m)
+        self.declare_parameter("avoid_ramp_step", 0.06)         # 호출당 오프셋 변화 상한 (m)
+        self.declare_parameter("avoid_left_offset_max", 0.9)    # 좌(+y) 상한 — 좌 조향 스톱 여유 부족
+        self.declare_parameter("avoid_obs_r_max", 0.6)          # 이보다 큰 클러스터(벽 등)는 회피 대상 제외
+        self.declare_parameter("avoid_obs_x_max", 8.0)          # 회피 대상 전방 거리 상한 (m)
+        # CONE — 진입/종료 (실차 신규: 감지 기반)
+        self.declare_parameter("cone_enter_r_min", 0.1)         # 콘으로 볼 클러스터 반경 하한 (m)
+        self.declare_parameter("cone_enter_r_max", 0.4)         # 콘으로 볼 클러스터 반경 상한 (m)
+        self.declare_parameter("cone_enter_min_clusters", 4)    # ROI 안 콘 클러스터 최소 개수
+        self.declare_parameter("cone_enter_scans", 3)           # 연속 스캔 수 (진입 디바운스)
+        self.declare_parameter("cone_exit_miss_scans", 20)      # miss 연속 스캔 수 (기존 40틱 → 20스캔)
+        self.declare_parameter("cone_grace_sec", 1.0)           # [SIM] 기존 20틱 — 진입 직후 miss 미계수
+        self.declare_parameter("cone_reenter_block_sec", 5.0)   # CONE 종료 직후 재진입 차단 (핑퐁 방지)
+        self.declare_parameter("cone_speed_cap", 16.0)          # [SIM] 예선 CONE_SPEED_FIXED — fixed 아님, cap
+        self.declare_parameter("corridor_fresh_sec", 0.5)       # /corridor_path 신선도 (기준선 우선 사용)
+        # CONE — 왼쪽 콘 피팅 (기존 _tick_cone 이식)
+        self.declare_parameter("cone_x_min", 0.3)               # [SIM] 전방 ROI 최소 (m)
+        self.declare_parameter("cone_x_max", 10.0)              # [SIM] 전방 ROI 최대 (m)
+        self.declare_parameter("cone_y_min", -6.0)              # [SIM] 좌우 ROI (m)
+        self.declare_parameter("cone_y_max", 6.0)               # [SIM]
+        self.declare_parameter("track_width", 4.4)              # [SIM] 예선 트랙 폭 — 본선 실측 예정
+        self.declare_parameter("cone_fit_min_points", 2)        # [SIM]
+        self.declare_parameter("cone_fit_min_x_span", 0.8)      # [SIM]
+        self.declare_parameter("cone_fit_deg2_span", 2.0)       # [SIM] x스팬 이 이상 + 3점이면 2차 피팅
+        self.declare_parameter("cone_fit_curve_max", 1.5)       # [SIM]
+        self.declare_parameter("cone_fit_slope_max", 3.0)       # [SIM]
+        self.declare_parameter("cone_left_accept_dist", 1.5)    # [SIM]
+        self.declare_parameter("cone_fit_smooth_alpha", 0.20)   # [SIM]
+        self.declare_parameter("cone_coast_decay", 0.2)         # [SIM] miss당 곡률항 감쇠
+        self.declare_parameter("cone_single_bias", 0.268)       # [SIM] 콘 1개 이하 시 시계방향 15°(tan15°) 보정
+        self.declare_parameter("cone_sample_x_start", 0.5)      # [SIM]
+        self.declare_parameter("cone_sample_x_end", 6.0)        # [SIM]
+        self.declare_parameter("cone_sample_n", 25)             # [SIM]
+        # 정지선(STOP) / SHORTCUT — heading은 전부 yaw_rel(출발 기준각) 기준
+        self.declare_parameter("stop_v_threshold", 312.0)       # [SIM] 480p 기준 STOP bbox 하단 v
+        self.declare_parameter("cross_v_threshold", 278.0)      # [SIM] CROSSROAD_OUT bbox 하단 v
+        self.declare_parameter("stop_heading_rel", 0.0)         # 정지선 직선 구간 yaw_rel (deg) — 코스 실측 예정
+        self.declare_parameter("stop_heading_tol", 10.0)        # [SIM] ±허용 (deg)
+        self.declare_parameter("stop_block_heading_rel", -90.0)  # [SIM] 기존 절대 270° 등가 — 코스 실측 예정
+        self.declare_parameter("stop_block_tol", 5.0)           # [SIM] ±허용 (deg)
+        self.declare_parameter("stop_block_sec", 3.0)           # [SIM] 기존 60틱 — 통과 후 정지선 트리거 차단
+        self.declare_parameter("sc_turn_target_deg", 90.0)      # 좌회전 목표 |Δyaw| (deg) — 코스 실측 예정
+        self.declare_parameter("sc_turn_timeout_sec", 6.0)      # BLOCK 안전망 (yaw 미갱신 대비 강제 진행)
+        self.declare_parameter("sc_follow_timeout_sec", 15.0)   # [SIM] 기존 300틱 — 하드 타임아웃 복원
+        self.declare_parameter("sc_wait_timeout_sec", 8.0)      # WAITING 타임아웃 — 초과 시 지름길 포기(래치 해제)
+        self.declare_parameter("left_debounce_hits", 2)         # [SIM] LEFT 이벤트 최소 검출 횟수
+        self.declare_parameter("shortcut_speed_cap", 15.0)      # [SIM] 예선 SHORTCUT_SPEED — cap으로
+        # PEDESTRIAN (본선은 회피로 대체 예정 — 기본 비활성)
+        self.declare_parameter("enable_pedestrian", False)
+        self.declare_parameter("ped_x_min", 1.5)                # [SIM]
+        self.declare_parameter("ped_x_max", 8.0)                # [SIM]
+        self.declare_parameter("ped_r_min", 0.1)                # [SIM] 사람 크기 클러스터 반경
+        self.declare_parameter("ped_r_max", 0.4)                # [SIM]
+        self.declare_parameter("ped_road_half_width", 1.2)      # [SIM] center 기준 도로 반폭
+        self.declare_parameter("ped_stop_sec", 2.2)             # [SIM] 기존 44틱 정지
+        self.declare_parameter("ped_cooldown_sec", 30.0)        # [SIM] 기존 600틱
+        self.declare_parameter("ped_freeze_sec", 1.5)           # [SIM] 기존 30틱 center freeze
+        self.declare_parameter("ped_car_cluster_count", 3)      # [SIM] 밀집=차 판정 개수
+        self.declare_parameter("ped_car_spread", 1.5)           # [SIM] 밀집 판정 거리
+        # CHILD ZONE (기본 비활성)
+        self.declare_parameter("enable_child_zone", False)
+        self.declare_parameter("child_start_v_thr", 200.0)      # [SIM]
+        self.declare_parameter("child_end_v_thr", 400.0)        # [SIM]
+        self.declare_parameter("child_exit_delay_sec", 3.0)     # [SIM] 기존 60틱
+        self.declare_parameter("child_enter_cooldown_sec", 3.0)  # [SIM] 기존 60틱
+        self.declare_parameter("child_exit_cooldown_sec", 10.0)  # [SIM] 기존 200틱
+        self.declare_parameter("child_hard_timeout_sec", 17.0)  # [SIM] 기존 340틱
+        self.declare_parameter("child_speed_cap", 22.0)         # [SIM] 예선 CHILD_ZONE_SPEED
+        self.declare_parameter("corner_boost_window_sec", 20.0)  # [SIM] 기존 400틱 — child 종료 후 부스트 창
+        self.declare_parameter("corner_boost_floor", 0.0)       # speed_floor. 0=비활성 — 본선 튜닝 예정
+        # S존 (기본 비활성 — 켜면 yaw_rel 기준. 절대각 판정 재도입 금지)
+        self.declare_parameter("enable_s_zone", False)
+        self.declare_parameter("s_zone_yaw_lo", 10.0)           # [SIM] yaw_rel 하한 (deg)
+        self.declare_parameter("s_zone_yaw_hi", 170.0)          # [SIM] yaw_rel 상한 (deg)
+        self.declare_parameter("s_zone_block_sec", 8.0)         # [SIM] 기존 160틱 — CONE→LANE 직후 오인 차단
+        # 라이다 측면/정면 창 (기존 _check_side 이식 — 창 ±1°→±3°, OVERTAKE 스텁 입력)
+        self.declare_parameter("side_left_angle_deg", 90.0)     # [SIM] 왼쪽 9시 방향
+        self.declare_parameter("side_right_angle_deg", -88.0)   # [SIM]
+        self.declare_parameter("side_half_deg", 3.0)            # 기존 ±1° → ±3° (500빔 incr 0.72° 대응)
+        self.declare_parameter("side_left_r_min", 0.5)          # [SIM]
+        self.declare_parameter("side_left_r_max", 3.2)          # [SIM]
+        self.declare_parameter("side_right_r_min", 0.01)        # [SIM]
+        self.declare_parameter("side_right_r_max", 3.0)         # [SIM]
+        self.declare_parameter("side_debounce_scans", 3)        # 연속 스캔 수 기준 (기존 틱 기준 대체)
+        self.declare_parameter("front_half_deg", 6.0)           # [SIM] 정면 콘 반각
+        self.declare_parameter("front_r_min", 0.3)              # [SIM]
+        self.declare_parameter("front_r_max", 8.0)              # [SIM]
 
-        # CONE 데이터
-        self._obstacles = []
-        self._cone_prev_fit = None
-        self._cone_miss = 0
-        self._cone_grace = 0
+        P = self._prm
 
-        # PEDESTRIAN
-        self._ped_timer = 0
-        self._ped_cooldown = 0
-        # 보행자가 차선 가릴 때 center_path 흔들림 방지: 직전 경로를 약 1.5초 freeze
-        self._path_freeze = 0
-        self._frozen_center = None
+        # ---------------- 상태 ----------------
+        self.phase = "IDLE"
+        self._wait_confirm = 0            # WAIT 출발 확인 카운트다운 (기존 6틱)
+        self._grace_until = 0.0           # 출발 후 정지선/지름길 무시 만료 시각
+        self._log_counter = 0
 
-        # SHORTCUT (지름길 좌회전)
-        self._stop_max_v = None          # /detect/road_pixels의 STOP bbox bottom v 최댓값
-        self._cross_max_v = None         # /detect/road_pixels의 CROSSROAD_OUT bbox bottom v 최댓값
-        self._sc_sub = None              # None | "WAITING" | "TURNING_1" | "FOLLOW" | "TURNING_2"
-        self._sc_tick = 0                # 현재 sub-state에서 머무른 틱 수
-        self._sc_cooldown = 0            # 재트리거 차단 카운터
-        self._left_signal_hits = 0       # LEFT 디바운싱용 누적 카운트
-        self._red_stopping = False       # RED + 정지선 정지 중 플래그 (로그 중복 방지)
-        self._stop_block_270 = 0         # 270도 부근 통과 후 STOP 차단 타이머
-        self._police_seen_ago = 999      # POLICE 마지막 감지 후 틱 수
+        # /drive_cmd 이번 틱 스냅샷 (매 틱 _tick에서 재계산 — 라치 금지)
+        self._cmd = self._fresh_cmd()
+        self._block_id = 0                # 마지막 발행 블록 id (새 블록마다 +1 = 원샷)
 
-        # 어린이 보호구역
-        self._child_zone = False
-        self._child_start_max_v = None
-        self._child_end_max_v = None
-        self._child_enter_cooldown = 0   # START 후 END 무시 카운터
-        self._child_exit_cooldown = 0    # END 후 START 무시 카운터
-        self._child_exit_timer = 0       # END 감지 후 지연 원복 타이머
-        self._child_total_ticks = 0      # child zone 진입 후 총 틱
-
-        # OVERTAKE (추월)
-        self._ot_sub = None              # None | LANE_TO_2ND | PASSING | CAR_BESIDE | CAR_PASSED | RETURN_TO_1ST
-        self._ot_tick = 0
-        self._ot_cooldown = 0
-        self._ot_right_fit = None        # 오른쪽 흰 실선 피팅
-        self._ot_yellow_fit = None       # 노란 중앙선 피팅
-        self._car_max_v = None           # YOLO 차량 bbox v
-        self._left_side_detected = False # 왼쪽 라이다 감지
-        self._right_side_detected = False # 오른쪽 라이다 감지
-        self._lane_offset = 0.0          # LANE/OVERTAKE 횡 오프셋 (좌+,우-)
-        self._s_zone_seen = False        # S자 구간 통과 latch (추월 트리거용)
-        self._front_min_range = float("inf")  # 정면 라이다 최소거리
-        self._ot_left_on = 0             # 왼쪽 감지 연속 카운트
-        self._ot_left_off = 0            # 왼쪽 소실 연속 카운트
-        self._ot_lane1_reached = False   # 1차선 목표 오프셋 도달 latch(정착 전환용)
-
-        # LANE 데이터 (친구 _on_lane과 동일 구조)
+        # 센서 캐시
         self._yellow_xs = np.array([], dtype=np.float64)
         self._yellow_ys = np.array([], dtype=np.float64)
         self._yellow_dash_xs = np.array([], dtype=np.float64)
@@ -283,69 +233,144 @@ class PathPlannerNode(Node):
         self._white_xs = np.array([], dtype=np.float64)
         self._white_ys = np.array([], dtype=np.float64)
         self._has_lane = False
+        self._lane_rx_time = -1e9         # /detect/lane 마지막 수신 시각 (신선도 가드)
+        self._lane_quality = 0.0          # 첫 수신 전 0 = 안전측(감속 cap)
+        self._light = "NONE"              # /detect/traffic_light (디바운스는 yolo가 함)
+        self._car = decode_car_state([])  # /car_state 안전 기본값
+        self._corridor = None             # [(x, y)] 외부팀 콘 통로
+        self._corridor_time = -1e9
+        self._manual_go_time = -1e9       # /manual_go 수신 시각 (실소비 시 리셋)
 
-        # YOLO 이벤트
-        self._events = []
+        # /detect/objects 파생 (메시지마다 덮어씀 — 클래스 없으면 None)
+        self._objects_time = -1e9
+        self._obj_cls = set()
+        self._stop_max_v = None
+        self._cross_max_v = None
+        self._child_start_max_v = None
+        self._child_end_max_v = None
+        self._car_max_v = None            # OVERTAKE 스텁 입력
 
-        # LANE 모드 중앙선 (사람 감지 기준선)
+        # /scan 파생
+        self._scan_seq = 0
+        self._scan_rx_time = -1e9         # /scan 마지막 수신 시각 (신선도 가드)
+        self._tracks = []
+        self._cone_enter_streak = 0       # ROI 안 콘 클러스터 충분 — 연속 스캔 수
+        self._side_left = False
+        self._side_right = False
+        self._left_on_s = self._left_off_s = 0
+        self._right_on_s = self._right_off_s = 0
+        self._front_min = float("inf")
+
+        # CONE
+        self._cone_prev_fit = None
+        self._cone_left_count = 0
+        self._cone_miss = 0               # 연속 miss 스캔 수
+        self._cone_seen_seq = -1          # miss 계수용 마지막 처리 스캔 번호
+        self._cone_grace_until = 0.0
+        self._cone_reenter_until = 0.0    # 종료 직후 재진입 차단 만료 시각
+
+        # 정지선/SHORTCUT
+        self._red_stopping = False
+        self._stop_block_until = 0.0      # 270° 등가 통과 후 정지선 트리거 차단 만료 시각
+        self._sc_sub = None               # None | WAITING | TURNING_1 | FOLLOW | TURNING_2
+        self._sc_started = 0.0
+        self._sc_left_hits = 0
+        self._sc_yaw_start = 0.0          # TURNING 진입 시 yaw_rel 캡처
+        self._shortcut_done = False       # 원샷 래치 — 평생 1회 (WAITING 타임아웃 시 해제)
+        self._sc_retry_until = 0.0        # WAITING 타임아웃 포기 후 재진입 쿨다운 만료 시각
+
+        # PEDESTRIAN
+        self._ped_until = 0.0
+        self._ped_cooldown_until = 0.0
+        self._path_freeze_until = 0.0
+        self._frozen_center = None
+
+        # CHILD ZONE
+        self._child_zone = False
+        self._child_enter_cd_until = 0.0
+        self._child_exit_cd_until = 0.0
+        self._child_exit_at = None        # END 감지 후 해제 예정 시각
+        self._child_deadline = 0.0
+        self._cb_until = 0.0              # 코너 부스트 창 만료 시각
+        self._cb_prev_child = False
+
+        # LANE
         self._lane_center_coef = None
         self._last_lane_result = None
+        self._lane_offset = 0.0           # path_gen이 적용 중인 횡오프셋 (디버그 필드)
+        self._s_zone_block_until = 0.0
+        self._s_zone_active = False
 
-        # IMU heading
-        self._heading_deg = 0.0
-        self._s_zone_block = 0           # CONE→LANE 직후 S존 오인 차단 타이머
-        self._s_zone_active = False      # 현재 S존 여부 (ped 오판 방지 게이트)
-        self._manual_offset = 0.0        # ot_tune 수동 횡오프셋 (튜닝용)
-        self._manual_hold = 0            # /manual_offset 수신 유지 카운트(끊기면 자동 해제)
-        self._cb_window = 0              # CHILD 종료 후 코너 부스트 윈도우
-        self._cb_prev_child = False      # child_zone 이전 상태(종료 전환 감지)
-        self._corner_boost = False       # 어린이보호 종료 후 20s 코너 부스트
+        # 순수 파이썬 모듈
+        self._tracker = ClusterTracker(
+            k=int(P("tracker_k")), n=int(P("tracker_n")),
+            match_dist=float(P("tracker_match_dist")))
+        self._path_gen = PathGen({
+            "clear_margin": float(P("avoid_clear_margin")),
+            "ramp_step": float(P("avoid_ramp_step")),
+            "left_offset_max": float(P("avoid_left_offset_max")),
+        })
+        self._overtake = OvertakeStub()
 
-        # 구독
-        self.create_subscription(PoseArray, "/fused/obstacles", self._on_obs, 10)
-        self.create_subscription(PoseArray, "/fused/lane", self._on_lane, 10)
-        self.create_subscription(PoseArray, "/detect/events_raw", self._on_events, 10)
-        # SHORTCUT용 YOLO 객체 픽셀 (STOP, CROSSROAD_OUT 거리 트리거)
-        self.create_subscription(PoseArray, "/detect/road_pixels", self._on_road, 10)
-        self.create_subscription(Imu, "/imu", self._on_imu, qos_profile_sensor_data)
+        # ---------------- 구독 ----------------
+        self.create_subscription(PoseArray, "/detect/lane", self._on_lane, 10)
+        self.create_subscription(PoseArray, "/detect/objects", self._on_objects, 10)
+        self.create_subscription(String, "/detect/traffic_light", self._on_light, 10)
+        self.create_subscription(Float32, "/detect/lane_quality", self._on_quality, 10)
         self.create_subscription(LaserScan, "/scan", self._on_scan, qos_profile_sensor_data)
-        self.create_subscription(Float32, "/manual_offset", self._on_manual_offset, 10)
-        self.create_subscription(String, "/detect/traffic_light", self._on_traffic_light, 10)
-        # 수동 좌회전 트리거 (모델 LEFT 미인식 임시 대체)
-        self.create_subscription(Bool, "/sc_go", self._on_sc_go, 10)
-        self._sc_go_flag = False
-        self._light_green = False        # legend_best.pt 신호등 green 상태
+        self.create_subscription(Float32MultiArray, "/car_state", self._on_car_state, 10)
+        self.create_subscription(PoseArray, "/corridor_path", self._on_corridor, 10)
+        self.create_subscription(Bool, "/manual_go", self._on_manual_go, 10)
 
-        # 발행
+        # ---------------- 발행 ----------------
         self._pub_center = self.create_publisher(PoseArray, "/center_path", 10)
         self._pub_target = self.create_publisher(PointStamped, "/target", 10)
         self._pub_left = self.create_publisher(PoseArray, "/lane_left", 10)
         self._pub_right = self.create_publisher(PoseArray, "/lane_right", 10)
-        self._pub_fits = self.create_publisher(PoseArray, "/lane_fits", 10)
-        self._pub_estop = self.create_publisher(Bool, "/emergency_stop", 10)
-        self._pub_lturn1 = self.create_publisher(Bool, "/left_turn1", 10)
-        self._pub_lturn2 = self.create_publisher(Bool, "/left_turn2", 10)
-        self._pub_child = self.create_publisher(Bool, "/child_zone", 10)
-        self._pub_szone = self.create_publisher(Bool, "/s_zone", 10)
-        self._pub_slow = self.create_publisher(Bool, "/slow_after_turn", 10)
-        self._pub_slow_merge = self.create_publisher(Bool, "/slow_merge", 10)
-        self._pub_ot_speed = self.create_publisher(Float32, "/overtake_speed", 10)
-        self._pub_cone = self.create_publisher(Bool, "/cone_mode", 10)
-        self._pub_sc_slow = self.create_publisher(Bool, "/shortcut_slow", 10)
-        self._pub_corner_boost = self.create_publisher(Bool, "/corner_boost", 10)
+        self._pub_cmd = self.create_publisher(Float32MultiArray, "/drive_cmd", 10)
+        # 출발 순간 yaw 기준각 캡처 트리거 (car_state_node가 구독)
+        self._pub_capture_yaw = self.create_publisher(Empty, "/capture_yaw", 1)
 
         self.create_timer(1.0 / PLAN_HZ, self._tick)
-        self._log_counter = 0
-        self.get_logger().info("PLANNER")
+        self.get_logger().info("PLANNER(실차) 시작")
 
-    # ---- 콜백 ----
+    # ---------------- 공통 헬퍼 ----------------
 
-    def _on_obs(self, msg: PoseArray):
-        self._obstacles = [(p.position.x, p.position.y, p.position.z)
-                           for p in msg.poses]
+    def _prm(self, name):
+        return self.get_parameter(name).value
+
+    def _now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    @staticmethod
+    def _fresh_cmd():
+        """이번 틱 /drive_cmd 스냅샷 초기값 — 매 틱 재계산 (라치 금지)."""
+        return {"owner": Owner.LANE, "steer_profile": SteerProfile.NORMAL,
+                "caps": [], "floor": 0.0, "fixed": 0.0, "block_param": 0.0}
+
+    def _take_manual_go(self, now):
+        """/manual_go 실소비 — 신선하면 True 반환 후 소진 (잔류 오발 방지)."""
+        if (now - self._manual_go_time) <= float(self._prm("manual_go_fresh_sec")):
+            self._manual_go_time = -1e9
+            return True
+        return False
+
+    def _objects_fresh(self, now):
+        return (now - self._objects_time) <= float(self._prm("objects_fresh_sec"))
+
+    def _lane_fresh(self, now):
+        """/detect/lane 신선도 — 스테일이면 경로 발행 중단 (인지 소실 폴백)."""
+        return (now - self._lane_rx_time) <= float(self._prm("lane_stale_sec"))
+
+    def _scan_fresh(self, now):
+        """/scan 신선도 — 스테일이면 동결 트랙 기반 회피·CONE 유지 금지."""
+        return (now - self._scan_rx_time) <= float(self._prm("scan_stale_sec"))
+
+    # ---------------- 콜백 ----------------
 
     def _on_lane(self, msg: PoseArray):
-        """친구 path_planner_node._on_lane 그대로 — cls_id로 노란/흰 분리."""
+        """기존 _on_lane 이식 — z(cls_id)로 노랑8/점선16/흰6,2 분리."""
+        self._lane_rx_time = self._now()   # 수신 시각 기록 (신선도 가드)
         self._has_lane = True
         if not msg.poses:
             self._yellow_xs = np.array([], dtype=np.float64)
@@ -364,26 +389,19 @@ class PathPlannerNode(Node):
         ym = np.isin(cls, list(YELLOW_CLS_IDS))
         dm = np.isin(cls, list(YELLOW_DASH_CLS_IDS))
         wm = np.isin(cls, list(WHITE_CLS_IDS))
-        self._yellow_xs = xs[ym]
-        self._yellow_ys = ys[ym]
-        self._yellow_dash_xs = xs[dm]
-        self._yellow_dash_ys = ys[dm]
-        self._white_xs = xs[wm]
-        self._white_ys = ys[wm]
+        self._yellow_xs, self._yellow_ys = xs[ym], ys[ym]
+        self._yellow_dash_xs, self._yellow_dash_ys = xs[dm], ys[dm]
+        self._white_xs, self._white_ys = xs[wm], ys[wm]
 
-    def _on_events(self, msg: PoseArray):
-        self._events = [int(p.position.z) for p in msg.poses]
-
-    def _on_road(self, msg: PoseArray):
-        """YOLO 객체 픽셀 — bbox bottom v 추출 (거리 proxy)."""
-        stop_v = None
-        cross_v = None
-        cs_v = None
-        ce_v = None
-        car_v = None
+    def _on_objects(self, msg: PoseArray):
+        """기존 _on_road 이식 — (u,v,cls)에서 클래스별 bbox 하단 v 최댓값(거리 proxy).
+        LEFT 등 이벤트 존재 검사도 여기(클래스 집합)서 한다."""
+        stop_v = cross_v = cs_v = ce_v = car_v = None
+        cls_set = set()
         for p in msg.poses:
             cls = int(p.position.z)
-            v_bot = float(p.position.y)
+            v_bot = float(p.position.y)   # bbox 하단 v (클수록 가까움)
+            cls_set.add(cls)
             if cls == STOP_CLS_ID:
                 if stop_v is None or v_bot > stop_v:
                     stop_v = v_bot
@@ -404,801 +422,695 @@ class PathPlannerNode(Node):
         self._child_start_max_v = cs_v
         self._child_end_max_v = ce_v
         self._car_max_v = car_v
+        self._obj_cls = cls_set
+        self._objects_time = self._now()
 
-    def _on_imu(self, msg: Imu):
-        q = msg.orientation
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._heading_deg = math.degrees(math.atan2(siny, cosy))
+    def _on_light(self, msg: String):
+        self._light = msg.data   # "GREEN" | "RED" | "NONE" (디바운스는 yolo가 함)
 
-    def _on_manual_offset(self, msg):
-        self._manual_offset = float(msg.data)
-        self._manual_hold = 10   # 0.5초(20Hz) 유지 — 끊기면 자동 해제
+    def _on_quality(self, msg: Float32):
+        self._lane_quality = float(msg.data)
 
-    def _on_traffic_light(self, msg):
-        self._light_green = (msg.data == "GREEN")
+    def _on_car_state(self, msg: Float32MultiArray):
+        self._car = decode_car_state(msg.data)
+
+    def _on_corridor(self, msg: PoseArray):
+        if msg.poses:
+            self._corridor = [(p.position.x, p.position.y) for p in msg.poses]
+            self._corridor_time = self._now()
+        # 빈 메시지 = 통로 없음 → 신선도 갱신 안 함 (자연 만료)
+
+    def _on_manual_go(self, msg: Bool):
+        if msg.data:
+            self._manual_go_time = self._now()
+
+    @staticmethod
+    def _scan_window(msg, angle, half, r_min, r_max):
+        """기존 _check_side 창 로직 이식 — 창 안 최소거리 반환 (미검출=inf)."""
+        lo, hi = angle - half, angle + half
+        idx_lo = max(0, int((lo - msg.angle_min) / msg.angle_increment))
+        idx_hi = min(len(msg.ranges), int((hi - msg.angle_min) / msg.angle_increment))
+        best = float("inf")
+        for i in range(idx_lo, idx_hi):
+            r = msg.ranges[i]
+            if math.isfinite(r) and r_min <= r <= r_max and r < best:
+                best = r
+        return best
 
     def _on_scan(self, msg: LaserScan):
-        """왼쪽/오른쪽 90도 방향 라이다 감지 (추월 시 옆 차량 확인)."""
-        def _check_side(angle, half, r_min, r_max):
-            lo = angle - half
-            hi = angle + half
-            idx_lo = max(0, int((lo - msg.angle_min) / msg.angle_increment))
-            idx_hi = min(len(msg.ranges), int((hi - msg.angle_min) / msg.angle_increment))
-            for i in range(idx_lo, idx_hi):
-                r = msg.ranges[i]
-                if np.isfinite(r) and r_min <= r <= r_max:
-                    return True
-            return False
-        self._left_side_detected = _check_side(
-            OT_LEFT_LIDAR_ANGLE, OT_LEFT_LIDAR_HALF,
-            OT_LEFT_LIDAR_R_MIN, OT_LEFT_LIDAR_R_MAX)
-        self._right_side_detected = _check_side(
-            OT_RIGHT_LIDAR_ANGLE, OT_RIGHT_LIDAR_HALF,
-            OT_RIGHT_LIDAR_R_MIN, OT_RIGHT_LIDAR_R_MAX)
+        P = self._prm
+        self._scan_seq += 1
+        self._scan_rx_time = self._now()   # 수신 시각 기록 (신선도 가드)
 
-        def _min_side(angle, half, r_min, r_max):
-            lo = angle - half
-            hi = angle + half
-            idx_lo = max(0, int((lo - msg.angle_min) / msg.angle_increment))
-            idx_hi = min(len(msg.ranges), int((hi - msg.angle_min) / msg.angle_increment))
-            best = float("inf")
-            for i in range(idx_lo, idx_hi):
-                r = msg.ranges[i]
-                if np.isfinite(r) and r_min <= r <= r_max and r < best:
-                    best = r
-            return best
-        self._front_min_range = _min_side(
-            0.0, OT_FRONT_HALF, OT_FRONT_R_MIN, OT_FRONT_R_MAX)
+        # 클러스터링 + 트래커 (확정 장애물 = path_gen/CONE/PED 공통 재료)
+        clusters = cluster_scan(
+            msg.ranges, msg.angle_min, msg.angle_increment,
+            r_min=float(P("cluster_r_min")), r_max=float(P("cluster_r_max")),
+            gap_m=float(P("cluster_gap_m")), min_pts=int(P("cluster_min_pts")),
+            gap_per_m=float(P("cluster_gap_per_m")), padding=float(P("cluster_padding")))
+        self._tracks = self._tracker.update(clusters)
 
-    def _on_sc_go(self, msg: Bool):
-        if msg.data:
-            self._sc_go_flag = True
+        # CONE 진입 감지 — ROI 안 콘 반경 클러스터 개수, 연속 스캔 디바운스
+        n_cone = 0
+        for t in self._tracks:
+            if not t["confirmed"]:
+                continue
+            if not (float(P("cone_x_min")) <= t["x"] <= float(P("cone_x_max"))):
+                continue
+            if not (float(P("cone_y_min")) <= t["y"] <= float(P("cone_y_max"))):
+                continue
+            if float(P("cone_enter_r_min")) <= t["r"] <= float(P("cone_enter_r_max")):
+                n_cone += 1
+        if n_cone >= int(P("cone_enter_min_clusters")):
+            self._cone_enter_streak += 1
+        else:
+            self._cone_enter_streak = 0
 
-    # ---- 메인 틱 ----
+        # 측면/정면 창 — 디바운스는 '연속 스캔 수' 기준 (OVERTAKE 스텁 입력)
+        half = math.radians(float(P("side_half_deg")))
+        deb = int(P("side_debounce_scans"))
+        left_hit = math.isfinite(self._scan_window(
+            msg, math.radians(float(P("side_left_angle_deg"))), half,
+            float(P("side_left_r_min")), float(P("side_left_r_max"))))
+        right_hit = math.isfinite(self._scan_window(
+            msg, math.radians(float(P("side_right_angle_deg"))), half,
+            float(P("side_right_r_min")), float(P("side_right_r_max"))))
+        if left_hit:
+            self._left_on_s += 1
+            self._left_off_s = 0
+        else:
+            self._left_off_s += 1
+            self._left_on_s = 0
+        if self._left_on_s >= deb:
+            self._side_left = True
+        elif self._left_off_s >= deb:
+            self._side_left = False
+        if right_hit:
+            self._right_on_s += 1
+            self._right_off_s = 0
+        else:
+            self._right_off_s += 1
+            self._right_on_s = 0
+        if self._right_on_s >= deb:
+            self._side_right = True
+        elif self._right_off_s >= deb:
+            self._side_right = False
+        self._front_min = self._scan_window(
+            msg, 0.0, math.radians(float(P("front_half_deg"))),
+            float(P("front_r_min")), float(P("front_r_max")))
+
+    # ---------------- 메인 틱 (20Hz) ----------------
 
     def _tick(self):
+        now = self._now()
         stamp = self.get_clock().now().to_msg()
+        P = self._prm
+
+        # 스냅샷 초기화 — 이번 틱에 해당 phase가 채운 것만 유효 (라치 금지)
+        self._cmd = self._fresh_cmd()
+
+        # 공통 선행 게이트: 270° 등가 통과 → 정지선 트리거 차단 타이머
+        # (red_stop과 shortcut '양쪽'에 공통 적용 — 기존 비대칭 버그 수정)
+        self._update_stop_block(now)
 
         if self.phase == "IDLE":
-            if len(self._obstacles) > 0 or self._has_lane:
-                self.get_logger().info("WAIT")
+            if self._has_lane or self._scan_seq > 0:
+                self.get_logger().info("WAIT — 센서 확인, 출발 신호 대기")
                 self.phase = "WAIT"
-            return
+            self._cmd["owner"] = Owner.MISSION_STOP
         elif self.phase == "WAIT":
-            self._tick_wait(stamp)
+            self._tick_wait(stamp, now)
         elif self.phase == "CONE":
-            self._tick_cone(stamp)
+            self._tick_cone(stamp, now)
         elif self.phase == "LANE":
-            if POLICE_CLS_ID in self._events:
-                self._police_seen_ago = 0
-            else:
-                self._police_seen_ago += 1
-            if self._start_grace_ticks > 0:
-                self._start_grace_ticks -= 1
-            if not PURE_DRIVE_MODE:
-                self._tick_child_zone()
-                if not IGNORE_PEDESTRIAN:
-                    self._check_pedestrian()
-                if self._start_grace_ticks <= 0:
-                    if self._check_red_stop(stamp):
-                        return
-                    self._check_shortcut()
-                    self._check_overtake()   # S자 끝(heading≈180) → 추월 진입
-            if self.phase == "LANE":
-                self._lane_offset = self._manual_offset if self._manual_hold > 0 else 0.0
-            self._tick_lane(stamp)
+            self._tick_lane_phase(stamp, now)
         elif self.phase == "PEDESTRIAN":
-            self._tick_pedestrian(stamp)
+            self._tick_pedestrian(stamp, now)
         elif self.phase == "SHORTCUT":
-            self._tick_shortcut(stamp)
-        elif self.phase == "OVERTAKE":
-            self._tick_overtake(stamp)
+            self._tick_shortcut(stamp, now)
+        else:
+            # OVERTAKE 스텁 포함 — 진입 경로 없음. 안전망으로 LANE 복귀.
+            self.get_logger().warn(f"미지원 phase {self.phase} → LANE 복귀")
+            self.phase = "LANE"
 
-        self._pub_cone.publish(Bool(data=(self.phase == "CONE")))
-        self._pub_sc_slow.publish(Bool(data=(self.phase == "SHORTCUT")))
+        # 공통 후행 (phase와 무관하게 매 틱 진행 — early-return 동결 금지)
+        self._update_s_zone(now)
+        self._update_corner_boost(now)
+        # 차선 품질도 /detect/lane 신선도 적용 — 스테일이면 0.0 취급 (안전측 감속 cap)
+        lane_q = self._lane_quality if self._lane_fresh(now) else 0.0
+        if lane_q < float(P("lane_quality_min")):
+            self._cmd["caps"].append(float(P("low_quality_speed_cap")))
 
-        # 로그
-        if self._manual_hold > 0:
-            self._manual_hold -= 1
-        # heading 270도(0~360 환산) 부근 통과 → 이후 STOP_BLOCK_270_TICKS 동안 STOP 차단
-        _h360 = self._heading_deg % 360.0
-        _d270 = abs(_h360 - STOP_BLOCK_270_DEG)
-        if _d270 > 180.0:
-            _d270 = 360.0 - _d270
-        if _d270 <= STOP_BLOCK_270_TOL:
-            self._stop_block_270 = STOP_BLOCK_270_TICKS
-        elif self._stop_block_270 > 0:
-            self._stop_block_270 -= 1
-        raw_szone = (S_ZONE_HEADING_LO <= self._heading_deg <= S_ZONE_HEADING_HI)
-        if self._s_zone_block > 0:
-            self._s_zone_block -= 1
-        # CONE→LANE 직후 차단구간이거나 LANE 주행이 아니면 S존 무시(오인 방지)
-        in_szone = raw_szone and self.phase == "LANE" and self._s_zone_block <= 0
-        self._s_zone_active = in_szone   # ped 게이트용(다음 틱 참조)
-        if in_szone:
-            self._s_zone_seen = True   # S자 통과 latch (추월 트리거 조건)
-        self._pub_szone.publish(Bool(data=in_szone))
+        self._publish_drive_cmd()
+        self._log_phase()
 
-        # 어린이보호 종료 후 20초간 코너 부스트 (motion에서 in_corner일 때만 적용, imu 조건 없음)
-        if self._cb_prev_child and not self._child_zone:
-            self._cb_window = CORNER_BOOST_WINDOW_TICKS
-        self._cb_prev_child = self._child_zone
-        if self._cb_window > 0:
-            self._cb_window -= 1
-        self._corner_boost = self._cb_window > 0
-        self._pub_corner_boost.publish(Bool(data=self._corner_boost))
+    def _log_phase(self):
         self._log_counter += 1
-        if self._log_counter >= PLAN_HZ:
-            self._log_counter = 0
-            phase_log = self.phase
-            if self.phase == "SHORTCUT":
-                phase_log = {
-                    "WAITING": "SC WAIT",
-                    "TURNING_1": "SC LT1",
-                    "FOLLOW": "SC RUN",
-                    "TURNING_2": "SC LT2",
-                }.get(self._sc_sub, "SC")
-            elif self.phase == "OVERTAKE":
-                phase_log = {
-                    "LANE_TO_2ND": "OT START",
-                    "PASSING": "OT PASS",
-                    "CAR_BESIDE": "OT SIDE",
-                    "RETURN_TO_1ST": "OT RET",
-                    "MERGE": "OT MERGE",
-                }.get(self._ot_sub, "OT")
-            elif self._child_zone:
-                phase_log = "CHILD"
-            if in_szone:
-                phase_log += " +S"
-            self.get_logger().info(phase_log)
+        if self._log_counter < PLAN_HZ:
+            return
+        self._log_counter = 0
+        label = self.phase
+        if self.phase == "SHORTCUT":
+            label = {"WAITING": "SC WAIT", "TURNING_1": "SC LT1",
+                     "FOLLOW": "SC RUN", "TURNING_2": "SC LT2"}.get(self._sc_sub, "SC")
+        if self._red_stopping:
+            label += " +STOP"
+        if self._child_zone:
+            label += " +CHILD"
+        if self._s_zone_active:
+            label += " +S"
+        self.get_logger().info(label)
 
-    # ---- WAIT ----
+    # ---------------- WAIT ----------------
 
-    def _tick_wait(self, stamp):
-        self._tick_lane(stamp)
-        self._pub_estop.publish(Bool(data=True))
+    def _tick_wait(self, stamp, now):
+        """정지 + 경로 워밍업. GREEN 또는 /manual_go → 6틱 확인 후 출발(기존 유지)."""
+        self._cmd["owner"] = Owner.MISSION_STOP
+        self._tick_lane_publish(stamp)
 
-        if self._wait_green_ticks > 0:
-            self._wait_green_ticks -= 1
-            if self._wait_green_ticks <= 0:
-                self.get_logger().info("CONE")
-                self.phase = "CONE"
-                self._cone_grace = CONE_GRACE_TICKS
-                self._cone_miss = 0
-                self._start_grace_ticks = 400  # 출발 후 20초간 STOP 무시
-                self._pub_estop.publish(Bool(data=False))
-            elif self._wait_green_ticks % PLAN_HZ == 0:
-                self.get_logger().info("GREEN")
+        if self._wait_confirm > 0:
+            self._wait_confirm -= 1
+            if self._wait_confirm <= 0:
+                self._start_drive(now)
             return
 
-        if self._light_green:
-            self._wait_green_ticks = 6   # green 확인 후 약 0.3초 뒤 출발(legend 모델, 주황오인 없음 → 3.6초 대기 제거)
+        if self._light == "GREEN" or self._take_manual_go(now):
+            self._wait_confirm = int(self._prm("start_confirm_ticks"))
+            self.get_logger().info(
+                f"출발 신호 — {self._wait_confirm}틱 확인 후 출발")
 
-            self.get_logger().info("GREEN")
+    def _start_drive(self, now):
+        """WAIT→LANE 직행 (예선의 무조건 CONE 진입 제거). start_grace는 시간 기준.
+        /capture_yaw 발행으로 '출발 순간 = yaw 기준각'을 실제로 성립시킨다."""
+        self.phase = "LANE"
+        self._grace_until = now + float(self._prm("start_grace_sec"))
+        # 출발 순간 기준각 캡처 — car_state_node가 /capture_yaw 수신 즉시 현재 yaw를 기준각으로 재캡처
+        self._pub_capture_yaw.publish(Empty())
+        car = self._car
+        self.get_logger().info(
+            "출발 → LANE. /capture_yaw 발행 — 이 순간 yaw가 출발 기준각으로 캡처됨 "
+            f"(발행 전 상태: yaw_ref_set={int(car['yaw_ref_set'])}, "
+            f"yaw_rel={car['yaw_rel_deg']:.1f}deg)")
 
-    # ---- CONE ----
+    # ---------------- LANE ----------------
 
-    def _tick_cone(self, stamp):
-        sample_xs = np.linspace(CONE_SAMPLE_X_START, CONE_SAMPLE_X_END, CONE_SAMPLE_N)
+    def _tick_lane_phase(self, stamp, now):
+        P = self._prm
+        obj_fresh = self._objects_fresh(now)
 
-        all_x = np.array([o[0] for o in self._obstacles])
-        all_y = np.array([o[1] for o in self._obstacles])
-        if all_x.size > 0:
-            roi = ((all_x >= CONE_X_MIN) & (all_x <= CONE_X_MAX)
-                   & (all_y >= CONE_Y_MIN) & (all_y <= CONE_Y_MAX))
-            all_x, all_y = all_x[roi], all_y[roi]
+        # CHILD ZONE (기본 비활성)
+        if bool(P("enable_child_zone")):
+            self._tick_child_zone(now, obj_fresh)
+        if self._child_zone:
+            self._cmd["caps"].append(float(P("child_speed_cap")))
 
-        left_fit = None
-        self._cone_left_count = 0
-        if all_x.size >= CONE_FIT_MIN_POINTS:
-            if self._cone_prev_fit is not None:
-                expected_y = np.polyval(self._cone_prev_fit, all_x)
-                left_mask = np.abs(all_y - expected_y) < CONE_LEFT_ACCEPT_DIST
-                method = "track"
-            else:
-                left_mask = all_y > 0
-                method = "y>0"
+        # PEDESTRIAN (기본 비활성 — S존 게이트 제거판)
+        if bool(P("enable_pedestrian")) and self._check_pedestrian(now):
+            self._cmd["owner"] = Owner.MISSION_STOP
+            self._tick_lane_publish(stamp)
+            return
 
-            lx, ly = all_x[left_mask], all_y[left_mask]
-            self._cone_left_count = lx.size
-            if lx.size >= CONE_FIT_MIN_POINTS:
-                x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
-                if x_span >= CONE_FIT_MIN_X_SPAN:
-                    try:
-                        deg = 2 if lx.size >= 3 and x_span >= 2.0 else 1
-                        w = 1.0 / (1.0 + lx * lx)
-                        coef = np.polyfit(lx, ly, deg, w=w)
-                        if deg == 1:
-                            coef = np.array([0.0, coef[0], coef[1]])
-                        a, b, _ = coef
-                        if abs(a) <= CONE_FIT_CURVE_MAX and abs(b) <= CONE_FIT_SLOPE_MAX:
-                            left_fit = coef
-                    except (np.linalg.LinAlgError, ValueError):
-                        pass
-
-        if self._cone_grace > 0:
-            self._cone_grace -= 1
-
-        if left_fit is None:
-            if self._cone_grace <= 0:
-                self._cone_miss += 1
-            if self._cone_prev_fit is not None and self._cone_miss <= CONE_FIT_MAX_MISS:
-                prev = self._cone_prev_fit.copy()
-                prev[0] *= max(0.0, 1.0 - self._cone_miss * 0.2)
-                left_fit = prev
-            else:
-                self._cone_prev_fit = None
-                if self._cone_grace <= 0 and self._cone_miss >= CONE_TO_LANE_MISS:
-                    self.get_logger().info("LANE")
-                    self.phase = "LANE"
-                    self._s_zone_block = S_ZONE_BLOCK_TICKS   # CONE→LANE 직후 S존 오인 차단
-                    self._tick_lane(stamp)  # 즉시 차선 경로 발행 (경로 끊김 방지)
+        # 정지선 로직 — 출발 grace(시간) 이후에만
+        if now >= self._grace_until:
+            gate_ok = self._stop_gate_ok(now)
+            if not self._red_stopping:
+                # 지름길 우선 (원샷 래치 안 섰을 때만) — 그 외엔 일반 red stop
+                self._check_shortcut(now, gate_ok, obj_fresh)
+                if self.phase == "SHORTCUT":
+                    self._cmd["owner"] = Owner.MISSION_STOP
+                    self._tick_lane_publish(stamp)
                     return
-                if self._cone_grace > 0:
-                    # grace 동안 피팅 실패 → 살짝 직진 (콘에 다가가기)
-                    sample_xs = np.linspace(CONE_SAMPLE_X_START, CONE_SAMPLE_X_END, CONE_SAMPLE_N)
-                    self._pub_center.publish(_poses_from_xy(stamp, sample_xs, np.zeros(CONE_SAMPLE_N)))
-                    self._publish_target(stamp, TARGET_X, 0.0)
-                return
-        else:
-            if self._cone_prev_fit is None:
-                self._cone_prev_fit = np.asarray(left_fit, dtype=np.float64)
+            self._check_red_stop(now, gate_ok, obj_fresh)
+        if self._red_stopping:
+            self._cmd["owner"] = Owner.MISSION_STOP
+
+        # CONE 진입 — LANE 중 감지 기반 (ROI 안 콘 클러스터 연속 스캔)
+        # 정지선 정지 중엔 진입 안 함(_red_stopping 라치 이월 방지) + 종료 직후 재진입 차단
+        if (self._cone_enter_streak >= int(P("cone_enter_scans"))
+                and not self._red_stopping
+                and now >= self._cone_reenter_until):
+            self._enter_cone(now)
+            self._tick_cone(stamp, now)
+            return
+
+        # OVERTAKE 스텁 — 활성화되면 오프셋/캡을 낼 자리 (현재 항상 None)
+        ot = self._overtake.update(
+            front_min_m=self._front_min, left_on=self._side_left,
+            right_on=self._side_right, car_v=self._car_max_v, car_state=self._car)
+        if ot:
+            cap = float(ot.get("speed_cap", 0.0))
+            if cap > 0.0:
+                self._cmd["caps"].append(cap)
+            # TODO(본선): ot["offset"]을 path_gen 기준선 오프셋으로 반영
+
+        self._tick_lane_publish(stamp)
+
+    # ---------------- 정지선 공통 게이트 + red stop + shortcut 진입 ----------------
+
+    def _update_stop_block(self, now):
+        """yaw_rel이 stop_block_heading_rel 부근이면 stop_block_sec 동안 정지선 차단.
+        (기존 절대 270° 로직의 yaw_rel 등가 — red_stop/shortcut 공통)"""
+        P = self._prm
+        if not self._car["yaw_ref_set"]:
+            return
+        d = abs(_circ_diff_deg(self._car["yaw_rel_deg"], float(P("stop_block_heading_rel"))))
+        if d <= float(P("stop_block_tol")):
+            self._stop_block_until = now + float(P("stop_block_sec"))
+
+    def _stop_gate_ok(self, now):
+        """정지선 트리거 공통 게이트: yaw 기준각 설정 + heading 창 + 차단 타이머."""
+        P = self._prm
+        if not self._car["yaw_ref_set"]:
+            return False              # 기준각 없인 heading 게이트 판정 불가 → 안전측 차단
+        if now < self._stop_block_until:
+            return False
+        d = abs(_circ_diff_deg(self._car["yaw_rel_deg"], float(P("stop_heading_rel"))))
+        return d <= float(P("stop_heading_tol"))
+
+    def _check_red_stop(self, now, gate_ok, obj_fresh):
+        """정지선 가까움 + GREEN 아님 → MISSION_STOP. GREEN으로만 해제.
+        (기존 POLICE/LEFT 분기 제거 — 지름길 전환은 _check_shortcut 전담)"""
+        P = self._prm
+        if self._red_stopping:
+            if self._light == "GREEN":
+                self._red_stopping = False
+                self.get_logger().info("GREEN → 출발 (red stop 해제)")
+            return
+        if not (gate_ok and obj_fresh):
+            return
+        if self._stop_max_v is None or self._stop_max_v < float(P("stop_v_threshold")):
+            return
+        if self._light == "GREEN":
+            return   # 초록불이면 그냥 통과
+        self._red_stopping = True
+        self.get_logger().info("정지선 + GREEN 아님 → MISSION_STOP (GREEN으로 해제)")
+
+    def _check_shortcut(self, now, gate_ok, obj_fresh):
+        """정지선 가까움 → SHORTCUT.WAITING 진입 — 평생 1회 (원샷 래치)."""
+        P = self._prm
+        if self._shortcut_done:
+            return
+        if now < self._sc_retry_until:
+            return   # WAITING 타임아웃 포기 직후 재진입 쿨다운 (같은 정지선 즉시 핑퐁 방지)
+        if not (gate_ok and obj_fresh):
+            return
+        if self._stop_max_v is None or self._stop_max_v < float(P("stop_v_threshold")):
+            return
+        self._shortcut_done = True     # 진입 시점에 래치 — 중도 이탈해도 재진입 없음
+        self.phase = "SHORTCUT"
+        self._sc_sub = "WAITING"
+        self._sc_started = now
+        self._sc_left_hits = 0
+        self.get_logger().info("SC WAIT — 정지. LEFT 디바운스 또는 /manual_go로 좌회전 확정")
+
+    # ---------------- SHORTCUT ----------------
+
+    def _tick_shortcut(self, stamp, now):
+        P = self._prm
+        self._cmd["caps"].append(float(P("shortcut_speed_cap")))
+
+        if self._sc_sub == "WAITING":
+            self._cmd["owner"] = Owner.MISSION_STOP
+            self._tick_lane_publish(stamp)
+            # LEFT 이벤트 디바운스 (기존 hit/감소 로직 유지) 또는 /manual_go 실소비
+            if self._objects_fresh(now) and LEFT_SIGN_CLS_ID in self._obj_cls:
+                self._sc_left_hits += 1
             else:
-                self._cone_prev_fit = (
-                    (1.0 - CONE_FIT_SMOOTH_ALPHA) * self._cone_prev_fit
-                    + CONE_FIT_SMOOTH_ALPHA * np.asarray(left_fit, dtype=np.float64))
+                self._sc_left_hits = max(0, self._sc_left_hits - 1)
+            if (self._sc_left_hits >= int(P("left_debounce_hits"))
+                    or self._take_manual_go(now)):
+                self._sc_enter_turn("TURNING_1", now)
+            elif (now - self._sc_started) >= float(P("sc_wait_timeout_sec")):
+                # WAITING 타임아웃 — LEFT/manual_go 없음 → 지름길 포기, LANE 복귀(정지 해제).
+                # 래치는 False로 되돌려 다음 기회에 재시도 가능하게 한다.
+                self._shortcut_done = False
+                self._sc_retry_until = now + float(P("sc_wait_timeout_sec"))
+                self.phase = "LANE"
+                self._sc_sub = None
+                self.get_logger().warn(
+                    "SC WAIT 타임아웃 — 지름길 포기 → LANE 복귀 (래치 해제, 재시도 가능)")
+
+        elif self._sc_sub in ("TURNING_1", "TURNING_2"):
+            # BLOCK: motion이 좌회전 실행, planner는 yaw 진행으로 종료 판정
+            target = float(P("sc_turn_target_deg"))
+            self._cmd["owner"] = Owner.BLOCK
+            self._cmd["block_param"] = target
+            self._tick_lane_publish(stamp)   # 경로는 계속 발행 (복귀 연속성/시각화)
+            prog = abs(_circ_diff_deg(self._car["yaw_rel_deg"], self._sc_yaw_start))
+            timeout = (now - self._sc_started) >= float(P("sc_turn_timeout_sec"))
+            if prog >= target or timeout:
+                if timeout:
+                    self.get_logger().warn(
+                        f"{self._sc_sub} 타임아웃 — |Δyaw|={prog:.1f}deg에서 강제 진행")
+                if self._sc_sub == "TURNING_1":
+                    self._sc_sub = "FOLLOW"
+                    self._sc_started = now
+                    self.get_logger().info(
+                        f"SC FOLLOW — |Δyaw|={prog:.1f}deg 도달, owner LANE 복귀")
+                else:
+                    self.get_logger().info(f"SC LT2 완료 — |Δyaw|={prog:.1f}deg")
+                    self._exit_shortcut_to_lane()
+
+        elif self._sc_sub == "FOLLOW":
+            # 지름길 차선 추종. CROSSROAD v임계 또는 하드 타임아웃(초) → TURNING_2
+            self._tick_lane_publish(stamp)
+            cross = (self._objects_fresh(now)
+                     and self._cross_max_v is not None
+                     and self._cross_max_v >= float(P("cross_v_threshold")))
+            timeout = (now - self._sc_started) >= float(P("sc_follow_timeout_sec"))
+            if cross or timeout:
+                if timeout:
+                    self.get_logger().warn("SC FOLLOW 하드 타임아웃 → TURNING_2 강제")
+                self._sc_enter_turn("TURNING_2", now)
+
+        else:
+            self.get_logger().warn("SC 알 수 없는 서브상태 → LANE 복귀")
+            self._exit_shortcut_to_lane()
+
+    def _sc_enter_turn(self, sub, now):
+        """TURNING 진입 — 새 block_id(+1=원샷) + yaw_rel 캡처."""
+        self._sc_sub = sub
+        self._sc_started = now
+        self._block_id += 1
+        self._sc_yaw_start = float(self._car["yaw_rel_deg"])
+        self.get_logger().info(
+            f"{sub} — BLOCK id={self._block_id}, 목표 |Δyaw|="
+            f"{float(self._prm('sc_turn_target_deg')):.0f}deg, "
+            f"기준 yaw_rel={self._sc_yaw_start:.1f}deg")
+
+    def _exit_shortcut_to_lane(self):
+        """SHORTCUT 종료 → LANE 복귀. (기존의 child_zone 강제 진입 제거)"""
+        self.phase = "LANE"
+        self._sc_sub = None
+        self.get_logger().info("SHORTCUT 완료 → LANE (원샷 — 재진입 없음)")
+
+    # ---------------- CONE ----------------
+
+    def _enter_cone(self, now):
+        self.get_logger().info(
+            f"CONE 진입 — 콘 클러스터 {self._cone_enter_streak}연속 스캔 감지")
+        self.phase = "CONE"
+        self._cone_prev_fit = None
+        self._cone_miss = 0
+        self._cone_seen_seq = self._scan_seq
+        self._cone_grace_until = now + float(self._prm("cone_grace_sec"))
+        self._cone_enter_streak = 0
+        self._lane_offset = 0.0        # 디버그 필드 정리 + LANE 복귀 시 0부터 램프
+        self._path_gen.reset()
+
+    def _cone_fit_attempt(self):
+        """기존 _tick_cone 왼쪽 콘 피팅 이식 — 확정 트랙에서 좌측 콘 줄 2차/1차 피팅."""
+        P = self._prm
+        self._cone_left_count = 0
+        pts = [(t["x"], t["y"]) for t in self._tracks if t["confirmed"]]
+        if not pts:
+            return None
+        all_x = np.array([p[0] for p in pts], dtype=np.float64)
+        all_y = np.array([p[1] for p in pts], dtype=np.float64)
+        roi = ((all_x >= float(P("cone_x_min"))) & (all_x <= float(P("cone_x_max")))
+               & (all_y >= float(P("cone_y_min"))) & (all_y <= float(P("cone_y_max"))))
+        all_x, all_y = all_x[roi], all_y[roi]
+        if all_x.size < int(P("cone_fit_min_points")):
+            return None
+
+        if self._cone_prev_fit is not None:
+            expected_y = np.polyval(self._cone_prev_fit, all_x)
+            left_mask = np.abs(all_y - expected_y) < float(P("cone_left_accept_dist"))
+        else:
+            left_mask = all_y > 0   # 첫 피팅은 좌측(y>0) 가정
+
+        lx, ly = all_x[left_mask], all_y[left_mask]
+        self._cone_left_count = int(lx.size)
+        if lx.size < int(P("cone_fit_min_points")):
+            return None
+        x_span = float(np.max(lx) - np.min(lx)) if lx.size >= 2 else 0.0
+        if x_span < float(P("cone_fit_min_x_span")):
+            return None
+        try:
+            deg = 2 if lx.size >= 3 and x_span >= float(P("cone_fit_deg2_span")) else 1
+            w = 1.0 / (1.0 + lx * lx)   # 가까운 콘 가중
+            coef = np.polyfit(lx, ly, deg, w=w)
+            if deg == 1:
+                coef = np.array([0.0, coef[0], coef[1]])
+            a, b, _ = coef
+            if abs(a) <= float(P("cone_fit_curve_max")) and abs(b) <= float(P("cone_fit_slope_max")):
+                return coef
+        except (np.linalg.LinAlgError, ValueError):
+            pass
+        return None
+
+    def _tick_cone(self, stamp, now):
+        """라바콘 주행 — profile=CONE + speed_cap. /corridor_path 신선 시 기준선 우선."""
+        P = self._prm
+        self._cmd["steer_profile"] = SteerProfile.CONE
+        self._cmd["caps"].append(float(P("cone_speed_cap")))
+
+        corridor_fresh = (self._corridor is not None and len(self._corridor) >= 2
+                          and (now - self._corridor_time) <= float(P("corridor_fresh_sec")))
+        new_scan = self._scan_seq != self._cone_seen_seq
+        if new_scan:
+            self._cone_seen_seq = self._scan_seq
+        in_grace = now < self._cone_grace_until
+
+        # /scan 스테일 가드 — 동결 트랙으로 피팅 유지 금지 + 매 틱 miss 계수
+        # (스캔 동결 시 miss가 안 늘어 CONE 탈출 불가가 되는 것 방지)
+        scan_fresh = self._scan_fresh(now)
+        raw_fit = self._cone_fit_attempt() if scan_fresh else None
+        left_fit = None
+        if raw_fit is None:
+            if not scan_fresh:
+                self._cone_miss += 1     # 스테일 — new_scan/grace 무관 매 틱 계수
+            elif new_scan and not in_grace:
+                self._cone_miss += 1     # miss는 '연속 스캔 수'로 계수 (틱 아님)
+            if (self._cone_prev_fit is not None
+                    and self._cone_miss < int(P("cone_exit_miss_scans"))):
+                coast = self._cone_prev_fit.copy()
+                coast[0] *= max(0.0, 1.0 - self._cone_miss * float(P("cone_coast_decay")))
+                left_fit = coast
+        else:
+            alpha = float(P("cone_fit_smooth_alpha"))
+            if self._cone_prev_fit is None:
+                self._cone_prev_fit = np.asarray(raw_fit, dtype=np.float64)
+            else:
+                self._cone_prev_fit = ((1.0 - alpha) * self._cone_prev_fit
+                                       + alpha * np.asarray(raw_fit, dtype=np.float64))
             left_fit = self._cone_prev_fit
             self._cone_miss = 0
 
+        # 종료 — miss 연속 스캔 (기존 40틱 → 20스캔). corridor 신선하면 유지.
+        if self._cone_miss >= int(P("cone_exit_miss_scans")) and not corridor_fresh:
+            self.get_logger().info(f"CONE 종료(miss {self._cone_miss}스캔) → LANE")
+            self.phase = "LANE"
+            self._cone_prev_fit = None
+            self._cone_reenter_until = now + float(P("cone_reenter_block_sec"))
+            self._s_zone_block_until = now + float(P("s_zone_block_sec"))
+            self._tick_lane_publish(stamp)   # 즉시 차선 경로 발행 (경로 끊김 방지)
+            return
+
+        # 기준선 1순위: 외부팀 콘 통로 (/corridor_path 신선 시)
+        if corridor_fresh:
+            self._publish_corridor(stamp)
+            return
+
+        n = int(P("cone_sample_n"))
+        sample_xs = np.linspace(float(P("cone_sample_x_start")),
+                                float(P("cone_sample_x_end")), n)
+        if left_fit is None:
+            # grace/미피팅 — 살짝 직진 (콘에 다가가기, 기존 유지)
+            self._pub_center.publish(_poses_from_xy(stamp, sample_xs, np.zeros(n)))
+            self._publish_target(stamp, TARGET_X, 0.0)
+            return
+
+        half = float(P("track_width")) / 2.0
         center_coef = left_fit.copy()
-        center_coef[2] -= TRACK_HALF_WIDTH
+        center_coef[2] -= half
         if self._cone_left_count <= 1:
-            center_coef[1] -= 0.268  # 시계방향 15도 (tan15°≈0.268), 콘 1개 이하일 때만
+            center_coef[1] -= float(P("cone_single_bias"))   # 콘 1개 이하 — 시계방향 보정
 
         left_ys = np.polyval(left_fit, sample_xs)
-        center_ys = np.clip(np.polyval(center_coef, sample_xs), -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
-        right_ys = center_ys - TRACK_HALF_WIDTH
+        center_ys = np.clip(np.polyval(center_coef, sample_xs),
+                            -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+        right_ys = center_ys - half
 
         self._pub_left.publish(_poses_from_xy(stamp, sample_xs, left_ys))
         self._pub_right.publish(_poses_from_xy(stamp, sample_xs, right_ys))
         self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
-
         target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
                                  -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
         self._publish_target(stamp, TARGET_X, target_y)
 
-    # ---- CHILD ZONE: 어린이 보호구역 속도 제한 ----
+    def _publish_corridor(self, stamp):
+        """외부팀 콘 통로를 기준선으로 발행 (/center_path 규격 동일)."""
+        xs = np.array([p[0] for p in self._corridor], dtype=np.float64)
+        ys = np.array([p[1] for p in self._corridor], dtype=np.float64)
+        self._pub_center.publish(_poses_from_xy(stamp, xs, ys))
+        half = float(self._prm("track_width")) / 2.0
+        self._pub_left.publish(_poses_from_xy(stamp, xs, ys + half))
+        self._pub_right.publish(_poses_from_xy(stamp, xs, ys - half))
+        order = np.argsort(xs)
+        ty = float(np.clip(np.interp(TARGET_X, xs[order], ys[order]),
+                           -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
+        self._publish_target(stamp, TARGET_X, ty)
 
-    def _tick_child_zone(self):
-        """어린이 보호구역 진입/해제 판단. 매 틱 호출."""
-        # 쿨다운 감소
-        if self._child_enter_cooldown > 0:
-            self._child_enter_cooldown -= 1
-        if self._child_exit_cooldown > 0:
-            self._child_exit_cooldown -= 1
+    # ---------------- PEDESTRIAN (기본 비활성) ----------------
 
-        if not self._child_zone:
-            # 진입 판단
-            if self._child_exit_cooldown > 0:
-                return
-            if (self._child_start_max_v is not None
-                    and self._child_start_max_v >= CHILD_START_V_THR):
-                self._child_zone = True
-                self._child_enter_cooldown = CHILD_ENTER_COOLDOWN_TICKS
-                self._child_exit_timer = 0
-                self._child_total_ticks = 0
-                self._pub_child.publish(Bool(data=True))
-                self.get_logger().info("CHILD ON")
-        else:
-            self._child_total_ticks += 1
-            # hard timeout
-            if self._child_total_ticks >= CHILD_HARD_TIMEOUT_TICKS:
-                self._child_zone = False
-                self._child_exit_cooldown = CHILD_EXIT_COOLDOWN_TICKS
-                self._pub_child.publish(Bool(data=False))
-                self.get_logger().info("CHILD OFF")
-                return
-            # 해제 판단
-            if self._child_exit_timer > 0:
-                self._child_exit_timer -= 1
-                if self._child_exit_timer <= 0:
-                    self._child_zone = False
-                    self._child_exit_cooldown = CHILD_EXIT_COOLDOWN_TICKS
-                    self._pub_child.publish(Bool(data=False))
-                    self.get_logger().info("CHILD OFF")
-                return
-            if self._child_enter_cooldown > 0:
-                return
-            if (self._child_end_max_v is not None
-                    and self._child_end_max_v >= CHILD_END_V_THR):
-                self._child_exit_timer = CHILD_EXIT_DELAY_TICKS
-                self.get_logger().info("CHILD END")
-
-    # ---- PEDESTRIAN: 사람 감지 → 정지 → 도로 밖으로 나가면 출발 ----
-
-    def _check_pedestrian(self):
-        """LANE 주행 중 도로 안에 사람(작은 장애물) 있으면 정지. 밀집 클러스터면 차→무시."""
-        if self._ped_cooldown > 0:
-            self._ped_cooldown -= 1
-            return
-        if not self._s_zone_active:
-            return  # 보행자는 S자 구간에만 등장 → 그 밖에선 ped 판정 안 함
-        if self._lane_center_coef is None:
-            return
-
-        # 도로 안 작은 클러스터 모으기 (r < 0.4 = 사람 크기)
-        road_obs = []
-        for ox, oy, _r in self._obstacles:
-            if ox > PED_X_MAX or ox < 1.5:
-                continue
-            if _r < 0.1 or _r >= 0.4:
-                continue  # 너무 작으면(점1개=노이즈/꼬깔) 무시, 너무 크면(차/나무) 무시
-            center_y = float(np.polyval(self._lane_center_coef, ox))
-            dist = abs(oy - center_y)
-            if dist <= PED_ROAD_HALF_WIDTH:
-                road_obs.append((ox, oy, _r))
-
-        if not road_obs:
-            return
-
-        # 도로 안 사람 후보 존재 → center_path를 직전값으로 약 1.5초 freeze
-        # (보행자가 차선을 잠깐 가려 경로가 휙휙 바뀌는 것 방지)
-        self._path_freeze = 30
-
-        # 밀집 판단: 도로 안 클러스터끼리 거리 PED_CAR_SPREAD 이내로 모여있으면 차
-        # 서로 가까운 클러스터 개수 세기
-        dense_count = 0
-        for i, (x1, y1, _) in enumerate(road_obs):
-            for x2, y2, _ in road_obs[i+1:]:
-                if abs(x1 - x2) + abs(y1 - y2) < PED_CAR_SPREAD:
-                    dense_count += 1
-
-        if len(road_obs) >= PED_CAR_CLUSTER_COUNT and dense_count >= 2:
-            return  # 밀집 클러스터 여러 개 = 차 → 무시 (친구 추월 담당)
-
-        # 사람: 도로 안 클러스터 1~2개, 밀집 아님
-        ox, oy, _r = road_obs[0]
-        self.get_logger().info("PED")
-        self._ped_timer = PED_MIN_STOP_TICKS
-        self.phase = "PEDESTRIAN"
-        from std_msgs.msg import Bool
-        self._pub_estop.publish(Bool(data=True))
-
-    def _tick_pedestrian(self, stamp):
-        """정지. _tick_lane 호출해서 피팅 유지, estop으로 motion 정지.
-        고정 3초(PED_MIN_STOP_TICKS) 정지 후 무조건 출발 (움직임 기준 X)."""
-        from std_msgs.msg import Bool
-        # 차선 피팅/발행 유지 (재출발 시 끊김 방지)
-        self._tick_lane(stamp)
-        # motion 정지
-        self._pub_estop.publish(Bool(data=True))
-
-        self._ped_timer -= 1
-
-        if self._ped_timer > 0:
-            return  # 최소 정지 시간 안 지남
-
-        # === 고정 3초 경과 → 무조건 출발 ===
-        self.get_logger().info("LANE")
-        self._pub_estop.publish(Bool(data=False))
-        self._ped_cooldown = PED_COOLDOWN_TICKS
-        self.phase = "LANE"
-
-        # --- 기존 사람-움직임 기준 재출발 로직 (주석처리: 고정 3초로 대체) ---
-        # # 사람이 중앙선 왼쪽(y > center_y)으로 넘어갔나?
-        # if self._lane_center_coef is not None:
-        #     for ox, oy, _r in self._obstacles:
-        #         if ox > PED_X_MAX or ox < 0.3:
-        #             continue
-        #         if _r < 0.1 or _r >= 0.4:
-        #             continue
-        #         center_y = float(np.polyval(self._lane_center_coef, ox))
-        #         if abs(oy - center_y) < PED_ROAD_HALF_WIDTH:
-        #             # 도로 안에 있음 — 중앙선 넘었나?
-        #             if oy > center_y:
-        #                 self.get_logger().info("LANE")
-        #                 self._pub_estop.publish(Bool(data=False))
-        #                 self._ped_cooldown = PED_COOLDOWN_TICKS
-        #                 self.phase = "LANE"
-        #                 return
-        #             else:
-        #                 return  # 아직 오른쪽 → 계속 정지
-        # # 장애물 사라짐 → 출발
-        # self.get_logger().info("LANE")
-        # self._pub_estop.publish(Bool(data=False))
-        # self._ped_cooldown = PED_COOLDOWN_TICKS
-        # self.phase = "LANE"
-
-    # ====================================================================
-    # SHORTCUT: 정지선 좌회전 지름길 — PEDESTRIAN 패턴 그대로 따라감
-    # 진입: LANE 안 _check_shortcut()가 STOP_v ≥ 임계 + POLICE 없음 확인
-    # sub-state: WAITING → TURNING_1 → FOLLOW → TURNING_2 → LANE 복귀
-    # ====================================================================
-
-    def _heading_ok_for_stop(self):
-        """heading이 정지선 방향 범위 안인지 확인."""
-        diff = abs(self._heading_deg - STOP_HEADING_TARGET)
-        if diff > 180:
-            diff = 360 - diff
-        return diff <= STOP_HEADING_TOL
-
-    def _check_red_stop(self, stamp):
-        """정지선 가까이 + GREEN 아님 → 정지. GREEN 뜰 때만 해제. True 반환 시 이번 틱 종료."""
-        police_recent = self._police_seen_ago <= 10  # 0.5초 이내 POLICE
-        # 이미 정지 중이면 GREEN + POLICE 최근으로 해제
-        if self._red_stopping:
-            if self._light_green and police_recent:
-                self._pub_estop.publish(Bool(data=False))
-                self.get_logger().info("GO")
-                self._red_stopping = False
-                return False
-            if ((self._light_green or LEFT_SIGN_CLS_ID in self._events)
-                    and not police_recent):
-                # GREEN 또는 LEFT 화살표 + POLICE 아님 → SHORTCUT.WAITING 진입
-                # (직진 GREEN만 기다리다 LEFT 화살표 타이밍 놓쳐 한 바퀴 도는 것 방지)
-                self._red_stopping = False
-                self.phase = "SHORTCUT"
-                self._sc_sub = "WAITING"
-                self._sc_tick = 0
-                self._left_signal_hits = 0
-                self._pub_estop.publish(Bool(data=True))
-                self.get_logger().info("SC WAIT")
-                return True
-            self._pub_estop.publish(Bool(data=True))
-            self._tick_lane(stamp)
-            return True
-        # 새로 진입: 정지선 + heading OK + GREEN 없음
-        if (self._stop_max_v is None or self._stop_max_v < STOP_V_THRESHOLD
-                or not self._heading_ok_for_stop()):
+    def _check_pedestrian(self, now):
+        """도로 안 사람 크기 클러스터 → 정지 전환. 밀집 다수=차량 → 무시.
+        (기존 이식 — S존 게이트 제거판). True 반환 시 PEDESTRIAN 전환됨."""
+        P = self._prm
+        if now < self._ped_cooldown_until:
             return False
-        if self._stop_block_270 > 0:
-            return False  # 270도 부근 통과 후 3초간 STOP 차단
-        if self._light_green and police_recent:
-            return False  # POLICE 교차로 + 초록불 → 그냥 통과
-        self.get_logger().info("STOP")
-        self._red_stopping = True
-        self._pub_estop.publish(Bool(data=True))
-        self._tick_lane(stamp)
+        if self._lane_center_coef is None:
+            return False
+
+        road_obs = []
+        for t in self._tracks:
+            if not t["confirmed"]:
+                continue
+            ox, oy, r = t["x"], t["y"], t["r"]
+            if ox > float(P("ped_x_max")) or ox < float(P("ped_x_min")):
+                continue
+            if r < float(P("ped_r_min")) or r >= float(P("ped_r_max")):
+                continue
+            center_y = float(np.polyval(self._lane_center_coef, ox))
+            if abs(oy - center_y) <= float(P("ped_road_half_width")):
+                road_obs.append((ox, oy, r))
+        if not road_obs:
+            return False
+
+        # 후보 존재 → center freeze (차선 가림 흔들림 방지)
+        self._path_freeze_until = now + float(P("ped_freeze_sec"))
+
+        dense = 0
+        for i, (x1, y1, _) in enumerate(road_obs):
+            for x2, y2, _ in road_obs[i + 1:]:
+                if abs(x1 - x2) + abs(y1 - y2) < float(P("ped_car_spread")):
+                    dense += 1
+        if len(road_obs) >= int(P("ped_car_cluster_count")) and dense >= 2:
+            return False   # 밀집 클러스터 다수 = 차량 → 무시
+
+        self.get_logger().info("PED — 보행자 감지, 정지")
+        self._ped_until = now + float(P("ped_stop_sec"))
+        self.phase = "PEDESTRIAN"
         return True
 
-    def _check_shortcut(self):
-        """LANE 주행 중 정지선이 충분히 가까우면 SHORTCUT 진입 판단."""
-        if self._sc_cooldown > 0:
-            self._sc_cooldown -= 1
-            return
-        if self._stop_max_v is None:
-            return
-        if self._stop_max_v < STOP_V_THRESHOLD:
-            return
-        if not self._heading_ok_for_stop():
-            return
+    def _tick_pedestrian(self, stamp, now):
+        """고정 시간 정지 후 무조건 재출발 (기존 유지 — 시간 기준으로)."""
+        self._cmd["owner"] = Owner.MISSION_STOP
+        self._tick_lane_publish(stamp)   # 피팅/발행 유지 (재출발 끊김 방지)
+        if now >= self._ped_until:
+            self.get_logger().info("PED 종료 → LANE")
+            self._ped_cooldown_until = now + float(self._prm("ped_cooldown_sec"))
+            self.phase = "LANE"
 
-        # POLICE 보이면 지름길 포기 — 같은 정지선 다시 안 트리거하게 쿨다운
-        if POLICE_CLS_ID in self._events:
-            self._sc_cooldown = SC_BYPASS_COOLDOWN_TICKS
-            self.get_logger().info("POLICE")
-            return
+    # ---------------- CHILD ZONE (기본 비활성) ----------------
 
-        # 진입
-        self.phase = "SHORTCUT"
-        self._sc_sub = "WAITING"
-        self._sc_tick = 0
-        self._left_signal_hits = 0
-        self._pub_estop.publish(Bool(data=True))
-        self.get_logger().info("SC WAIT")
-
-    def _tick_shortcut(self, stamp):
-        """SHORTCUT sub-state dispatch."""
-        if self._sc_sub == "WAITING":
-            self._tick_sc_waiting(stamp)
-        elif self._sc_sub == "TURNING_1":
-            self._tick_sc_turning(stamp, after="FOLLOW")
-        elif self._sc_sub == "FOLLOW":
-            self._tick_sc_follow(stamp)
-        elif self._sc_sub == "TURNING_2":
-            self._tick_sc_turning(stamp, after="LANE")
-        else:
-            # 알 수 없는 sub — 안전망
-            self.get_logger().warn("SC ERR")
-            self._exit_shortcut_to_lane()
-
-    def _tick_sc_waiting(self, stamp):
-        """정지하고 LEFT 신호 대기."""
-        self._pub_estop.publish(Bool(data=True))
-        self._tick_lane(stamp)
-        self._sc_tick += 1
-
-        if LEFT_SIGN_CLS_ID in self._events:
-            self._left_signal_hits += 1
-        else:
-            self._left_signal_hits = max(0, self._left_signal_hits - 1)
-
-        if self._sc_tick % PLAN_HZ == 0:
-            self.get_logger().info("SC WAIT")
-
-        if self._left_signal_hits >= LEFT_SIGNAL_DEBOUNCE_TICKS:
-            self._pub_estop.publish(Bool(data=False))
-            self._sc_sub = "TURNING_1"
-            self._sc_tick = 0
-            self.get_logger().info("LT1")
-
-    def _tick_sc_turning(self, stamp, after):
-        """좌회전: motion_node에 /left_turn1 or /left_turn2 신호."""
-        if self._sc_tick == 0:
-            if after == "FOLLOW":
-                self._pub_lturn1.publish(Bool(data=True))
-            else:
-                self._pub_lturn2.publish(Bool(data=True))
-        self._sc_tick += 1
-
-        ticks = SC_TURN_TICKS
-        if self._sc_tick % PLAN_HZ == 0:
-            self.get_logger().info("SC TURN")
-
-        if self._sc_tick >= ticks:
-            if after == "FOLLOW":
-                self._sc_sub = "FOLLOW"
-                self._sc_tick = 0
-                self.get_logger().info("SC FOLLOW")
-            elif after == "LANE":
-                self.get_logger().info("LANE")
-                self._exit_shortcut_to_lane()
-
-    def _tick_sc_follow(self, stamp):
-        """지름길 위 차선 추종. CROSSROAD 가까워지거나 timeout이면 TURNING_2."""
-        self._tick_lane(stamp)
-        self._sc_tick += 1
-
-        if self._sc_tick % PLAN_HZ == 0:
-            self.get_logger().info("SC FOLLOW")
-
-        if self._cross_max_v is not None and self._cross_max_v >= CROSS_V_THRESHOLD:
-            self._sc_sub = "TURNING_2"
-            self._sc_tick = 0
-            self.get_logger().info("LT2")
-            return
-
-        # # 종료 조건 2: hard timeout (임시 비활성화)
-        # if self._sc_tick >= SC_FOLLOW_HARD_TIMEOUT_TICKS:
-        #     self._sc_sub = "TURNING_2"
-        #     self._sc_tick = 0
-        #     self.get_logger().warn(
-        #         f"FOLLOW timeout ({SC_FOLLOW_HARD_TIMEOUT_TICKS} ticks) → TURNING_2 (강제)")
-        #     return
-
-    def _exit_shortcut_to_lane(self):
-        """SHORTCUT 종료 → LANE 복귀, 재진입 쿨다운 설정."""
-        self.get_logger().info("LANE")
-        self.phase = "LANE"
-        self._sc_sub = None
-        self._sc_tick = 0
-        self._sc_cooldown = SC_DONE_COOLDOWN_TICKS
-        self._left_signal_hits = 0
-        self._pub_estop.publish(Bool(data=False))
-        # (slow_after_turn 제거: CHILD 속도보다 낮은 5로 캡돼 "예전 속도"가 나오던 원인.
-        #  지름길 진입도 일반 child zone과 동일하게 CHILD_ZONE_SPEED 적용)
-        # 좌회전 직후 무조건 어린이 보호구역 진입
-        self._child_zone = True
-        self._child_enter_cooldown = CHILD_ENTER_COOLDOWN_TICKS
-        self._child_exit_timer = 0
-        self._child_total_ticks = 0
-        self._pub_child.publish(Bool(data=True))
-        self.get_logger().info("CHILD ON")
-
-    def _publish_left_arc(self, stamp):
-        """원점에서 좌측으로 휘는 호를 /center_path와 /target으로 발행.
-        theta 기반 파라미터화로 90도 이상 회전 가능.
-        """
-        thetas = np.linspace(0.05, np.radians(SC_TURN_DEG), SC_ARC_SAMPLE_N)
-        xs = SC_TURN_R * np.sin(thetas)          # 전방
-        ys = SC_TURN_R * (1.0 - np.cos(thetas))  # 좌측 (y > 0)
-
-        self._pub_center.publish(_poses_from_xy(stamp, xs, ys))
-        self._pub_left.publish(_poses_from_xy(stamp, xs, ys + 1.0))
-        self._pub_right.publish(_poses_from_xy(stamp, xs, ys - 1.0))
-        self._publish_target(stamp, float(xs[-1]), float(ys[-1]))
-
-    # ---- OVERTAKE: 추월 ----
-
-    def _check_overtake(self):
-        """S자 종료(heading≈180) 감지 → OVERTAKE 진입.
-        차량은 라이다로만 보이므로 트리거는 순수 기하: s_zone 통과 뒤 heading 도달."""
-        if self._ot_cooldown > 0:
-            self._ot_cooldown -= 1
-            return
-        if self._child_zone:
-            return
-        if not self._s_zone_seen:
-            return
-        if self._heading_deg < OT_TRIGGER_HEADING:
-            return
-        self.phase = "OVERTAKE"
-        self._ot_sub = "IN_LANE2"
-        self._ot_tick = 0
-        self._lane_offset = OT_LANE2_OFFSET
-        self._s_zone_seen = False
-        self._ot_left_on = 0
-        self._ot_left_off = 0
-        self._ot_lane1_reached = False
-        self.get_logger().info("OVERTAKE 진입 → 2차선(우 1.5m)")
-
-    def _tick_overtake(self, stamp):
-        """OVERTAKE: 노란 중앙선 plan() + self._lane_offset 로 주행."""
-        self._tick_child_zone()              # 추월 중에도 child zone 감지 유지(종료 조건)
-        # 속도 캡: 2차선 단계=a(OT_LANE2_SPEED), 1차선 단계=a보다 조금 빠르게(OT_LANE1_SPEED)
-        if self._ot_sub == "CUT_TO_LANE1":
-            self._pub_ot_speed.publish(Float32(data=OT_LANE1_SPEED))
-        else:
-            self._pub_ot_speed.publish(Float32(data=OT_LANE2_SPEED))
-        if self._ot_sub == "IN_LANE2":
-            self._tick_ot_in_lane2()
-        elif self._ot_sub == "LANE1_BESIDE":
-            self._tick_ot_lane1_beside()
-        elif self._ot_sub == "LANE1_PASSED":
-            self._tick_ot_lane1_passed()
-        elif self._ot_sub == "CUT_TO_LANE1":
-            self._tick_ot_cut_to_lane1()
-        else:
-            self._exit_overtake()
-            return
-        self._tick_lane(stamp)
-
-    def _tick_ot_in_lane2(self):
-        """2차선(우) 안착 → 왼쪽 라이다에 1차선 차가 '확실히' 잡힐 때까지."""
-        self._ot_tick += 1
-        self._lane_offset = OT_LANE2_OFFSET
-        if self._ot_tick < OT_LANE2_MIN_TICKS:   # 먼저 2차선에 안착
-            self._ot_left_on = 0
-            return
-        self._ot_left_on = self._ot_left_on + 1 if self._left_side_detected else 0
-        if self._ot_left_on >= OT_LEFT_ON_TICKS:
-            self._ot_sub = "LANE1_BESIDE"
-            self._ot_tick = 0
-            self._ot_left_off = 0
-            self.get_logger().info("OT: 왼쪽 차 옆(확정)")
-        elif self._ot_tick >= OT_LANE2_MAX_TICKS:
-            # 왼쪽 차 끝내 미감지 → 거짓 추월판정 대신 추월 취소(LANE 복귀)
-            self.get_logger().info("OT: 왼쪽 차 미감지 → 추월 취소")
-            self._exit_overtake()
-
-    def _tick_ot_lane1_beside(self):
-        """1차선 차가 옆에 있는 동안 2차선 유지. '확실히' 사라지면(지나치면) 대기."""
-        self._ot_tick += 1
-        self._lane_offset = OT_LANE2_OFFSET
-        self._ot_left_off = self._ot_left_off + 1 if not self._left_side_detected else 0
-        if self._ot_left_off >= OT_LEFT_OFF_TICKS:
-            self._ot_sub = "LANE1_PASSED"
-            self._ot_tick = 0
-            self.get_logger().info("OT: 왼쪽 차 지나침(확정)")
-
-    def _tick_ot_lane1_passed(self):
-        """지나친 뒤 2초 대기(내 차가 앞서도록) + 정면(2차선 차) 충분히 멀어야 1차선 진입."""
-        self._ot_tick += 1
-        self._lane_offset = OT_LANE2_OFFSET
-        front_ok = (OT_FRONT_GAP_MIN <= 0.0) or (self._front_min_range >= OT_FRONT_GAP_MIN)
-        if self._ot_tick >= OT_PASS_DELAY_TICKS and front_ok:
-            self._ot_sub = "CUT_TO_LANE1"
-            self._ot_tick = 0
-            self.get_logger().info("OT: 1차선 진입")
-
-    def _tick_ot_cut_to_lane1(self):
-        """1차선(좌) 주행. 좌 1.0 목표로 가다 측정 좌측 오프셋이 REACH(0.9) 넘으면
-        0.7로 당겨 정착(왼쪽 꼬깔 충돌 방지). child zone 진입하면 종료."""
-        self._ot_tick += 1
-        ego_off = 0.0
-        if self._lane_center_coef is not None:
-            ego_off = -float(np.polyval(self._lane_center_coef, OT_OFFSET_PROBE_X))
-        if not self._ot_lane1_reached and ego_off >= OT_LANE1_REACH:
-            self._ot_lane1_reached = True
-            self.get_logger().info(f"OT: 1차선 도달 → 좌 {OT_LANE1_SETTLE} 정착")
-        self._lane_offset = OT_LANE1_SETTLE if self._ot_lane1_reached else OT_LANE1_OFFSET
-        # child_zone가 컷인 '도중'에 떠도 바로 abort하지 않고 1차선 도달(_ot_lane1_reached) 후에만
-        # 종료 → 횡이동 방향 급반전(추월↔child 충돌/버벅) 방지. 미도달이면 MAX_TICKS로만 탈출.
-        if (self._child_zone and self._ot_lane1_reached) or self._ot_tick >= OT_LANE1_MAX_TICKS:
-            self.get_logger().info("OVERTAKE 완료 → LANE")
-            self._exit_overtake()
-
-    def _exit_overtake(self):
-        self.phase = "LANE"
-        self._ot_sub = None
-        self._ot_tick = 0
-        self._ot_cooldown = OT_COOLDOWN_TICKS
-        self._lane_offset = 0.0
-        self._pub_ot_speed.publish(Float32(data=0.0))
-
-    def _ot_update_fits(self):
-        """추월 중 흰선/노란선 피팅 업데이트."""
-        # 오른쪽 흰 실선
-        if self._white_xs.size >= 3:
-            rx, ry = self._ot_extract_right(self._white_xs, self._white_ys)
-            new_fit = self._ot_fit(rx, ry, self._ot_right_fit)
-            if new_fit is not None:
-                if self._ot_right_fit is not None:
-                    self._ot_right_fit = ((1.0 - OT_EMA_ALPHA) * self._ot_right_fit
-                                          + OT_EMA_ALPHA * new_fit)
-                else:
-                    self._ot_right_fit = new_fit
-        # 노란선
-        if self._yellow_xs.size >= OT_FIT_MIN_POINTS:
-            new_fit = self._ot_fit(self._yellow_xs, self._yellow_ys, self._ot_yellow_fit)
-            if new_fit is not None:
-                if self._ot_yellow_fit is not None:
-                    self._ot_yellow_fit = ((1.0 - OT_EMA_ALPHA) * self._ot_yellow_fit
-                                           + OT_EMA_ALPHA * new_fit)
-                else:
-                    self._ot_yellow_fit = new_fit
-
-    @staticmethod
-    def _ot_extract_right(xs, ys):
-        """x 구간별 최소 Y → 오른쪽 실선."""
-        bins = np.arange(0.5, 8.0, OT_X_BIN_SIZE)
-        rx, ry = [], []
-        for bx in bins:
-            mask = (xs >= bx) & (xs < bx + OT_X_BIN_SIZE)
-            if not mask.any():
-                continue
-            idx = np.argmin(ys[mask])
-            rx.append(float(xs[mask][idx]))
-            ry.append(float(ys[mask][idx]))
-        return np.array(rx), np.array(ry)
-
-    @staticmethod
-    def _ot_fit(xs, ys, prev_fit):
-        """아웃라이어 제거 + 2차 피팅."""
-        if prev_fit is not None and xs.size >= 3:
-            expected = np.polyval(prev_fit, xs)
-            inlier = np.abs(ys - expected) < OT_OUTLIER_THR
-            if inlier.sum() >= OT_FIT_MIN_POINTS:
-                xs, ys = xs[inlier], ys[inlier]
-        if xs.size < OT_FIT_MIN_POINTS:
-            return None
-        x_span = float(xs.max() - xs.min())
-        if x_span < 1.0:
-            return None
-        try:
-            deg = 2 if xs.size >= 6 and x_span >= 2.0 else 1
-            coef = np.polyfit(xs, ys, deg)
-            if deg == 1:
-                coef = np.array([0.0, coef[0], coef[1]])
-            return coef
-        except (np.linalg.LinAlgError, ValueError):
-            return None
-
-    def _ot_publish_path(self, stamp, fit, offset):
-        """피팅 + 오프셋으로 center_path 발행."""
-        center_coef = fit.copy()
-        center_coef[2] += offset
-        sample_xs = np.linspace(0.5, 8.0, 20)
-        center_ys = np.clip(np.polyval(center_coef, sample_xs),
-                            -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
-        self._pub_center.publish(_poses_from_xy(stamp, sample_xs, center_ys))
-        target_y = float(np.clip(np.polyval(center_coef, TARGET_X),
-                                 -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
-        self._publish_target(stamp, TARGET_X, target_y)
-
-    # ---- LANE (친구 plan() 그대로) ----
-
-    def _tick_lane(self, stamp):
-        if not self._has_lane:
-            if self.phase == "LANE" and self._publish_last_lane(stamp):
+    def _tick_child_zone(self, now, obj_fresh):
+        """어린이 보호구역 진입/해제 — 기존 이식 (틱 → 초 단위)."""
+        P = self._prm
+        if not self._child_zone:
+            if now < self._child_exit_cd_until:
                 return
+            if (obj_fresh and self._child_start_max_v is not None
+                    and self._child_start_max_v >= float(P("child_start_v_thr"))):
+                self._child_zone = True
+                self._child_enter_cd_until = now + float(P("child_enter_cooldown_sec"))
+                self._child_deadline = now + float(P("child_hard_timeout_sec"))
+                self._child_exit_at = None
+                self.get_logger().info("CHILD ON")
             return
 
-        # OVERTAKE 중엔 plan() 자체 회피를 끄고(빈 장애물) 오프셋 주행만 — 이중 회피 방지
-        lane_obs = [] if self.phase == "OVERTAKE" else self._obstacles
+        if now >= self._child_deadline:
+            self._child_off(now, "하드 타임아웃")
+            return
+        if self._child_exit_at is not None:
+            if now >= self._child_exit_at:
+                self._child_off(now, "END 지연 해제")
+            return
+        if now < self._child_enter_cd_until:
+            return
+        if (obj_fresh and self._child_end_max_v is not None
+                and self._child_end_max_v >= float(P("child_end_v_thr"))):
+            self._child_exit_at = now + float(P("child_exit_delay_sec"))
+            self.get_logger().info("CHILD END 감지 — 지연 후 해제")
+
+    def _child_off(self, now, reason):
+        self._child_zone = False
+        self._child_exit_cd_until = now + float(self._prm("child_exit_cooldown_sec"))
+        self.get_logger().info(f"CHILD OFF ({reason})")
+
+    # ---------------- 공통 cmd 갱신 ----------------
+
+    def _update_s_zone(self, now):
+        """S존 판정 — enable_s_zone일 때만, yaw_rel 기준 (절대각 재도입 금지)."""
+        P = self._prm
+        if not bool(P("enable_s_zone")) or not self._car["yaw_ref_set"]:
+            self._s_zone_active = False
+            return
+        yaw = float(self._car["yaw_rel_deg"])
+        raw = float(P("s_zone_yaw_lo")) <= yaw <= float(P("s_zone_yaw_hi"))
+        active = raw and self.phase == "LANE" and now >= self._s_zone_block_until
+        self._s_zone_active = active
+        if active:
+            self._cmd["steer_profile"] = SteerProfile.S_ZONE
+
+    def _update_corner_boost(self, now):
+        """child 종료 후 일정 시간 speed_floor (예선 corner_boost 대체 — 기본 비활성)."""
+        P = self._prm
+        if self._cb_prev_child and not self._child_zone:
+            self._cb_until = now + float(P("corner_boost_window_sec"))
+        self._cb_prev_child = self._child_zone
+        floor = float(P("corner_boost_floor"))
+        if floor > 0.0 and now < self._cb_until:
+            self._cmd["floor"] = max(self._cmd["floor"], floor)
+
+    def _publish_drive_cmd(self):
+        """이번 틱 스냅샷 발행 — cap은 후보 최솟값, fixed는 cap에 종속."""
+        c = self._cmd
+        caps = [v for v in c["caps"] if v > 0.0]
+        cap = min(caps) if caps else 0.0
+        fixed = float(c["fixed"])
+        if cap > 0.0 and fixed > cap:
+            fixed = cap   # speed_fixed는 cap에 종속 (예선 '무조건 대입' 버그 재발 방지)
+        msg = Float32MultiArray()
+        msg.data = encode_drive_cmd({
+            "owner": float(c["owner"]),
+            "steer_profile": float(c["steer_profile"]),
+            "speed_cap": cap,
+            "speed_floor": float(c["floor"]),
+            "speed_fixed": fixed,
+            "block_id": float(self._block_id if c["owner"] == Owner.BLOCK else 0),
+            "block_param": float(c["block_param"]),
+            "lane_offset": float(self._lane_offset),
+        })
+        self._pub_cmd.publish(msg)
+
+    # ---------------- LANE 경로 생성/발행 ----------------
+
+    def _tick_lane_publish(self, stamp):
+        """기존 _tick_lane 이식 — plan()엔 빈 장애물(내부 시프트 비활성),
+        회피는 path_gen 오프셋 최적화가 전담 (이중회피 방지 패턴 전 구간 적용)."""
+        # 인지 소실 가드: /detect/lane 스테일이면 /center_path 발행 중단 —
+        # motion의 path 워치독(path_stale_sec)이 감속 정지시킨다 (설계된 폴백).
+        # /drive_cmd는 계속 나간다 (_publish_drive_cmd는 _tick에서 무조건 호출).
+        if not self._lane_fresh(self._now()):
+            if self._has_lane:   # 최초 수신 전 기동 소음 방지 — 소실만 경고
+                self.get_logger().warning(
+                    "/detect/lane 스테일 — /center_path 발행 중단 (drive_cmd만 유지)",
+                    throttle_duration_sec=1.0)
+            return
+        if not self._has_lane:
+            self._publish_last_lane(stamp)
+            return
         result = lane_plan(self._yellow_xs, self._yellow_ys,
                            self._white_xs, self._white_ys,
-                           lane_obs,
+                           [],   # 빈 장애물 — plan() 내부 0.8m 시프트 비활성
                            child_zone=self._child_zone,
                            yellow_dash_xs=self._yellow_dash_xs,
                            yellow_dash_ys=self._yellow_dash_ys)
-
         if result is None:
-            if self.phase == "LANE" and self._publish_last_lane(stamp):
-                return
+            self._publish_last_lane(stamp)
             return
-
         self._last_lane_result = self._copy_lane_result(result)
         self._publish_lane_result(stamp, result)
 
@@ -1217,61 +1129,60 @@ class PathPlannerNode(Node):
         }
 
     def _publish_last_lane(self, stamp):
+        """차선 미검출 시 직전 결과 재발행 (경로 공백 방지)."""
         if self._last_lane_result is None:
             return False
         self._publish_lane_result(stamp, self._last_lane_result)
         return True
 
     def _publish_lane_result(self, stamp, result):
-        # center_path의 coef 저장 (사람 감지 기준선으로 사용)
+        """기존 이식 + 수술: 기준선에 path_gen(확정 장애물) 오프셋 적용 후 발행."""
+        P = self._prm
         all_fits = result.get("all_fits", [])
         if all_fits:
-            self._lane_center_coef = all_fits[0]  # yellow_fit = center
+            self._lane_center_coef = all_fits[0]   # yellow_fit = center (PED 기준선)
 
         target_x, target_y = result["target"]
-        sample_xs = result["sample_xs"]
+        sample_xs = np.asarray(result["sample_xs"], dtype=np.float64)
+        sample_ys = np.asarray(result["sample_ys"], dtype=np.float64)
 
-        # center_path freeze: 보행자 감지 중이면 직전 경로를 재발행 (흔들림 방지)
-        if self._path_freeze > 0 and self._frozen_center is not None:
-            pub_xs, pub_ys = self._frozen_center
-            self._path_freeze -= 1
+        # 확정(confirmed) 클러스터 중 회피 대상만 → path_gen (램프/히스테리시스 내장)
+        # /scan 스테일이면 동결된 트랙으로 회피하지 않도록 빈 리스트
+        if self._scan_fresh(self._now()):
+            obstacles = [
+                {"x": t["x"], "y": t["y"], "r": t["r"]}
+                for t in self._tracks
+                if t["confirmed"]
+                and 0.0 < t["x"] <= float(P("avoid_obs_x_max"))
+                and t["r"] <= float(P("avoid_obs_r_max"))   # 벽 등 대형 클러스터 제외
+            ]
         else:
-            pub_xs, pub_ys = sample_xs, result["sample_ys"]
+            obstacles = []
+        gen = self._path_gen.generate(sample_xs, sample_ys, obstacles)
+        self._lane_offset = float(gen["offset"])
+        pub_ys = np.clip(gen["ys"], -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+        target_y = float(np.clip(target_y + self._lane_offset,
+                                 -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
+
+        # center freeze — 보행자 감지 중 직전 경로 재발행 (기존 이식, 시간 기준)
+        if self._now() < self._path_freeze_until and self._frozen_center is not None:
+            pub_xs, pub_ys = self._frozen_center
+        else:
+            pub_xs = sample_xs
             self._frozen_center = (pub_xs, pub_ys)
 
-        # OVERTAKE 횡 오프셋 (노란 중앙선 기준 좌+/우- 시프트). LANE 기본은 0.
-        offset = getattr(self, "_lane_offset", 0.0)
-        left_ys = result["left_ys"]
-        right_ys = result["right_ys"]
-        if offset != 0.0:
-            pub_ys = np.clip(np.asarray(pub_ys, dtype=np.float64) + offset,
-                             -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
-            target_y = float(np.clip(target_y + offset, -TARGET_Y_LIMIT, TARGET_Y_LIMIT))
-            left_ys = np.clip(np.asarray(left_ys, dtype=np.float64) + offset,
-                              -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
-            right_ys = np.clip(np.asarray(right_ys, dtype=np.float64) + offset,
-                               -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+        offset = self._lane_offset
+        left_ys = np.clip(np.asarray(result["left_ys"], dtype=np.float64) + offset,
+                          -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
+        right_ys = np.clip(np.asarray(result["right_ys"], dtype=np.float64) + offset,
+                           -TARGET_Y_LIMIT, TARGET_Y_LIMIT)
 
         self._publish_target(stamp, target_x, target_y)
-        self._pub_center.publish(_make_pose_array(stamp, pub_xs, pub_ys))
-        self._pub_left.publish(_make_pose_array(stamp, sample_xs, left_ys))
-        self._pub_right.publish(_make_pose_array(stamp, sample_xs, right_ys))
+        self._pub_center.publish(_poses_from_xy(stamp, pub_xs, pub_ys))
+        self._pub_left.publish(_poses_from_xy(stamp, sample_xs, left_ys))
+        self._pub_right.publish(_poses_from_xy(stamp, sample_xs, right_ys))
 
-        all_fits = result.get("all_fits", [])
-        if all_fits:
-            flat = PoseArray()
-            flat.header.stamp = stamp
-            flat.header.frame_id = "lidar_frame"
-            for coef in all_fits:
-                ys = _polyval_clipped(coef, sample_xs)
-                for x, y in zip(sample_xs, ys):
-                    p = Pose()
-                    p.position.x = float(x)
-                    p.position.y = float(y)
-                    flat.poses.append(p)
-            self._pub_fits.publish(flat)
-
-    # ---- 공통 ----
+    # ---------------- 공통 ----------------
 
     def _publish_target(self, stamp, x, y):
         t = PointStamped()
