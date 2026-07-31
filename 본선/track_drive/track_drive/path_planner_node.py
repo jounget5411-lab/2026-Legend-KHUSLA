@@ -22,6 +22,7 @@
 """
 
 import math
+import os
 
 import numpy as np
 
@@ -41,6 +42,11 @@ from .lane_planner import (
 from .lib.drive_cmd import Owner, SteerProfile, encode_drive_cmd, decode_car_state
 from .lib.cluster import cluster_scan, ClusterTracker
 from .lib.path_gen import PathGen
+
+# /detect/objects 의 v 를 기준 해상도로 환산할 때 실제 프레임 높이의 출처.
+# (cv2 를 끌고 오는 lib.bev 대신 yaml 한 줄만 읽는다 — planner 는 영상 처리 안 함)
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CAMERA_YAML = os.path.join(_PKG_ROOT, "config", "camera.yaml")
 
 # ======================== YOLO 클래스 ID (best.pt 학습 시점 기준) ========================
 # 0=BLACK_CAR 1=CHILD_END 2=CHILD_LANE 3=CHILD_START 4=CROSSROAD_OUT 5=GOAL
@@ -109,6 +115,14 @@ class PathPlannerNode(Node):
         self.declare_parameter("start_confirm_ticks", 6)        # [SIM] 기존 6틱 출발 확인 유지
         self.declare_parameter("start_grace_sec", 20.0)         # [SIM] 기존 400틱 — 출발 후 정지선/지름길 무시
         self.declare_parameter("objects_fresh_sec", 0.5)        # /detect/objects 신선도 (v임계 판정 전제)
+        # ── /detect/objects 의 v(픽셀)를 기준 해상도로 환산 ──────────────────
+        # 아래 *_v_threshold 들은 전부 예선 시뮬 480p 에서 튜닝된 픽셀값이다.
+        # 실차 카메라는 1920x1080 으로 올라갔으므로(캘리브 기준) 그냥 두면
+        # v 가 2.25배로 들어와 STOP/CROSSROAD 가 훨씬 멀리서 오발동한다.
+        # → 들어오는 v 를 obj_v_ref_height 기준으로 스케일해서 임계값의 의미를
+        #   해상도와 무관하게 고정한다. 실제 높이는 camera.yaml 이 단일 출처.
+        self.declare_parameter("obj_v_ref_height", 480.0)       # 임계값들이 튜닝된 기준 높이
+        self.declare_parameter("camera_yaml", DEFAULT_CAMERA_YAML)
         self.declare_parameter("lane_stale_sec", 0.6)           # /detect/lane 신선도 — 초과 시 경로 발행 중단
         self.declare_parameter("scan_stale_sec", 1.0)           # /scan 신선도 — 초과 시 장애물 무시·CONE miss 계수
         self.declare_parameter("manual_go_fresh_sec", 2.0)      # /manual_go 유효 시간 (실소비 전 잔류 방지)
@@ -240,6 +254,9 @@ class PathPlannerNode(Node):
         self._corridor = None             # [(x, y)] 외부팀 콘 통로
         self._corridor_time = -1e9
         self._manual_go_time = -1e9       # /manual_go 수신 시각 (실소비 시 리셋)
+
+        # /detect/objects 의 v 스케일 (기동 시 1회 확정 — 매 메시지 계산 금지)
+        self._obj_v_scale = self._resolve_obj_v_scale()
 
         # /detect/objects 파생 (메시지마다 덮어씀 — 클래스 없으면 None)
         self._objects_time = -1e9
@@ -393,6 +410,38 @@ class PathPlannerNode(Node):
         self._yellow_dash_xs, self._yellow_dash_ys = xs[dm], ys[dm]
         self._white_xs, self._white_ys = xs[wm], ys[wm]
 
+    def _resolve_obj_v_scale(self):
+        """/detect/objects 의 v 를 obj_v_ref_height 기준으로 환산할 배율.
+
+        camera.yaml 의 image_height 가 실제 프레임 높이의 단일 출처다
+        (sensors.launch.py 의 해상도도 여기에 맞춰져 있어야 한다).
+        읽기 실패 / 미기재면 1.0 (환산 안 함) + 경고 — 조용히 틀리지 않게.
+        """
+        ref = float(self.get_parameter("obj_v_ref_height").value)
+        path = str(self.get_parameter("camera_yaml").value)
+        h = None
+        try:
+            import yaml as _yaml
+            with open(path, "r", encoding="utf-8") as f:
+                data = _yaml.safe_load(f)
+            if isinstance(data, dict):
+                h = float(data["image_height"])
+        except Exception:                     # noqa: BLE001 — 어떤 실패든 폴백
+            h = None
+
+        if not ref or ref <= 0 or h is None or h <= 0:
+            self.get_logger().warn(
+                f"[objects] camera.yaml 에서 image_height 를 못 읽었다 (path={path}) — "
+                f"v 환산 생략(x1.0). *_v_threshold 는 {ref:.0f}p 기준값이라 "
+                "실제 해상도가 다르면 STOP/CROSSROAD 가 오발동한다.")
+            return 1.0
+
+        scale = ref / h
+        self.get_logger().info(
+            f"[objects] v 환산: 실제 {h:.0f}p → 기준 {ref:.0f}p (x{scale:.4f}) "
+            f"— *_v_threshold 는 {ref:.0f}p 픽셀값 그대로 쓴다")
+        return scale
+
     def _on_objects(self, msg: PoseArray):
         """기존 _on_road 이식 — (u,v,cls)에서 클래스별 bbox 하단 v 최댓값(거리 proxy).
         LEFT 등 이벤트 존재 검사도 여기(클래스 집합)서 한다."""
@@ -400,7 +449,8 @@ class PathPlannerNode(Node):
         cls_set = set()
         for p in msg.poses:
             cls = int(p.position.z)
-            v_bot = float(p.position.y)   # bbox 하단 v (클수록 가까움)
+            # bbox 하단 v (클수록 가까움). 임계값이 튜닝된 기준 해상도로 환산.
+            v_bot = float(p.position.y) * self._obj_v_scale
             cls_set.add(cls)
             if cls == STOP_CLS_ID:
                 if stop_v is None or v_bot > stop_v:

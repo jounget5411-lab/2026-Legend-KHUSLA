@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""170도 어안 카메라 내부 파라미터(K/D) 체커보드 캘리브 (독립 CLI, ROS 불필요).
+"""[deprecated: calib_camera.py 사용] 170도 어안 카메라 내부 파라미터(K/D) 체커보드 캘리브.
+
+⚠ deprecated — tools/calib_camera.py 로 대체됐다. 이 파일은 참고용으로만 남긴다.
+   실차 카메라는 실측 HFOV≈87°/VFOV≈64° 의 일반 광각 렌즈였고(벤더 PDF 의 "170도
+   어안"은 오기), 87° 렌즈에 등거리(fisheye) 모델을 쓰면 과파라미터화로 CHECK_COND
+   실패/가장자리 악화가 난다. 아래로 갈아탈 것:
+     python3 calib_camera.py --dir calib_imgs --board 9x6 --square 0.025 \
+         --model plumb_bob --save ../config/camera.yaml
+   진짜 어안 렌즈라면 calib_camera.py --model fisheye 가 이 파일과 동일 로직이다.
+   또한 이 파일은 camera.yaml 에 model 키를 쓰지 않으므로 단독 사용 시
+   lib/bev.py 의 모델 분기와 어긋날 수 있다.
 
 역할: capture_frames.py 로 모은 체커보드 이미지에서 cv2.fisheye.calibrate 로
       K(내부행렬)/D(왜곡계수 k1~k4)를 구해 콘솔 출력 + camera.yaml 병합 저장.

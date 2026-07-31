@@ -8,6 +8,10 @@
 입력: --image 사진, --scan npz(ranges/angle_min/angle_inc), --camera camera.yaml.
 출력: 오버레이 창 표시(--no-show 로 생략), --save 시 jpg 저장.
 예선 대비 변경점: 신규 도구 (시뮬은 좌표 정합이 tf 로 보장돼 검증 불필요했음).
+본선 수정: undistort 를 lib/bev.py 의 load_camera_config + Undistorter 로 위임.
+      예전에는 cv2.fisheye.* 를 new_K=K 로 하드코딩해서, plumb_bob 카메라
+      (실차 실측 = 일반 광각)에서는 왜곡모델도 new_K 도 둘 다 틀렸다.
+      그러면 H 가 정확해도 오버레이가 어긋나 "캘리브 실패" 로 오판하게 된다.
 
 사용법:
   python3 verify_lidar_cam.py --image ground.jpg --scan scan.npz \
@@ -31,6 +35,8 @@
 """
 
 import argparse
+import importlib.util
+import os
 import sys
 
 import cv2
@@ -44,9 +50,83 @@ GRID_Y = (-1.0, -0.5, 0.0, 0.5, 1.0)   # 좌우 등간격선 (m)
 PIX_CLIP = 4000        # 투영 픽셀이 이 범위를 벗어나면 그리기 제외 (수치 폭주 방지)
 
 
-# ======================== camera.yaml 로드 ========================
+# ======================== camera.yaml 로드 / undistort ========================
+# ★ 주행 노드(lib/bev.py)와 완전히 같은 undistort 를 써야 한다. H 는 undistort 된
+#   픽셀 좌표계(new_K) 기준이라, 여기서 1픽셀이라도 다르게 펴면 오버레이가 어긋나
+#   멀쩡한 캘리브를 "실패" 로 오판하게 된다.
 
-def _load_camera(path):
+_BEV_MEMO = []
+
+
+def _import_bev():
+    """lib/bev.py 를 파일 경로로 로드 (tools/ 는 ROS 패키지 밖이라 일반 import 불가).
+
+    bev 는 rclpy 미의존(numpy/cv2/yaml 만)이라 CLI 도구에서 그대로 쓸 수 있다.
+    """
+    if _BEV_MEMO:
+        return _BEV_MEMO[0]
+    mod = None
+    path = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "track_drive", "lib", "bev.py"))
+    if os.path.isfile(path):
+        try:
+            spec = importlib.util.spec_from_file_location("_track_drive_bev", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:      # 로드 실패해도 도구는 굴러가야 한다
+            print("[안내] lib/bev.py 로드 실패 (%s) — 로컬 폴백 undistort 사용" % e)
+            mod = None
+    _BEV_MEMO.append(mod)
+    return mod
+
+
+def _load_camera(path, alpha_override=None):
+    """camera.yaml → (H, undistort 함수, 안내문). 주행 노드와 동일 경로로 로드."""
+    bev = _import_bev()
+    if bev is None:
+        return _load_camera_fallback(path, alpha_override)
+
+    cam = bev.load_camera_config(path)
+    if cam.get("note"):
+        print("[camera.yaml] %s" % cam["note"])
+    if not cam.get("h_calibrated", False):
+        print("[경고] h_calibrated:false — H 가 실차 캘리브값이 아니다(예선 시뮬 폴백). "
+              "오버레이는 당연히 어긋난다. tools/calib_ground_h.py 로 H 를 먼저 잡을 것.")
+    if not cam.get("intrinsics_calibrated", False):
+        print("[경고] intrinsics_calibrated:false — K/D 미보정이라 undistort 가 "
+              "패스스루다. tools/import_camera_info.py 또는 calib_camera.py 를 먼저.")
+
+    alpha = (bev.UNDISTORT_ALPHA_DEFAULT if alpha_override is None
+             else float(alpha_override))
+
+    def undistort(img):
+        h, w = img.shape[:2]
+        size = (w, h)
+        cal_size = cam.get("image_size")
+        if cal_size is not None and tuple(cal_size) != size:
+            print("[경고] 이미지 크기 %dx%d 가 캘리브 기준 %dx%d 와 다르다 — "
+                  "new_K/H 가 그 크기 기준이라 좌표계가 어긋난다."
+                  % (w, h, cal_size[0], cal_size[1]))
+        und = bev.Undistorter.from_config(cam, size, alpha=alpha)
+        if not und.enabled:
+            print("[경고] undistort 비활성(K/D 미보정 또는 맵 생성 실패) — "
+                  "원본 픽셀에 그대로 투영한다.")
+            return img
+        warn = bev.check_new_K_match(cam.get("new_K"), und.new_K)
+        if warn:
+            print("[경고] %s" % warn)
+        nk = np.asarray(und.new_K, np.float64).reshape(3, 3)
+        print("undistort: model=%s, alpha=%.2f, new_K fx,fy,cx,cy = "
+              "%.3f %.3f %.3f %.3f"
+              % (und.model, alpha, nk[0, 0], nk[1, 1], nk[0, 2], nk[1, 2]))
+        return und.apply(img)
+
+    return np.asarray(cam["H"], np.float64).reshape(3, 3), undistort
+
+
+def _load_camera_fallback(path, alpha_override):
+    """lib/bev.py 를 못 읽을 때 — 같은 규약을 직접 구현 (모델 분기 포함)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
@@ -56,26 +136,48 @@ def _load_camera(path):
         sys.exit("camera.yaml 형식 오류: %s" % path)
     try:
         K = np.asarray(data["K"], np.float64).reshape(3, 3)
-        D = np.asarray(data["D"], np.float64).reshape(-1)[:4]
+        D = np.asarray(data["D"], np.float64).reshape(-1)
         H = np.asarray(data["H"], np.float64).reshape(3, 3)
     except (KeyError, TypeError, ValueError):
         sys.exit("camera.yaml 에 K/D/H 없음/형식 오류: %s" % path)
-    if not bool(data.get("calibrated", False)):
-        print("[경고] calibrated:false — 이 H 는 실차 캘리브가 아닐 수 있음(시뮬 폴백?). "
-              "오버레이가 어긋나면 calib_fisheye.py → calib_ground_h.py 순서로 캘리브.")
-    return K, D, H
 
+    model = str(data.get("model", "")).strip().lower()
+    if model not in ("plumb_bob", "fisheye"):
+        model = "fisheye" if D.size == 4 else "plumb_bob"
+    yaml_new_K = data.get("new_K")
+    alpha = 0.0 if alpha_override is None else float(alpha_override)
 
-def _undistort(img, K, D):
-    """lib/bev.py Undistorter 와 동일 규약: new_K = K (H 좌표계 일치 필수)."""
-    if np.allclose(K, np.eye(3)) or not np.any(D):
-        print("[경고] K/D 미캘리브(단위행렬) — undistort 생략, 원본 픽셀에 투영.")
-        return img
-    h, w = img.shape[:2]
-    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
-        K, D.reshape(4, 1), np.eye(3), K, (w, h), cv2.CV_16SC2)
-    return cv2.remap(img, map1, map2, cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_CONSTANT)
+    def undistort(img):
+        if np.allclose(K, np.eye(3)) or not np.any(D):
+            print("[경고] K/D 미캘리브 — undistort 생략, 원본 픽셀에 투영.")
+            return img
+        h, w = img.shape[:2]
+        try:
+            if model == "fisheye":
+                Dm = np.concatenate([D, np.zeros(max(0, 4 - D.size))])[:4]
+                nk = (K.copy() if yaml_new_K is None
+                      else np.asarray(yaml_new_K, np.float64).reshape(3, 3))
+                m1, m2 = cv2.fisheye.initUndistortRectifyMap(
+                    K, Dm.reshape(4, 1), np.eye(3), nk, (w, h), cv2.CV_16SC2)
+            else:
+                Dm = np.concatenate([D, np.zeros(max(0, 5 - D.size))])
+                if yaml_new_K is None:
+                    nk, _ = cv2.getOptimalNewCameraMatrix(K, Dm, (w, h), alpha)
+                    nk = np.asarray(nk, np.float64).reshape(3, 3)
+                else:
+                    nk = np.asarray(yaml_new_K, np.float64).reshape(3, 3)
+                m1, m2 = cv2.initUndistortRectifyMap(
+                    K, Dm, np.eye(3), nk, (w, h), cv2.CV_16SC2)
+        except (cv2.error, TypeError, ValueError):
+            print("[경고] undistort 맵 생성 실패 — 원본 픽셀에 투영.")
+            return img
+        print("undistort(폴백): model=%s, alpha=%.2f, new_K fx,fy,cx,cy = "
+              "%.3f %.3f %.3f %.3f"
+              % (model, alpha, nk[0, 0], nk[1, 1], nk[0, 2], nk[1, 2]))
+        return cv2.remap(img, m1, m2, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT)
+
+    return H, undistort
 
 
 # ======================== 차량좌표 → 픽셀 투영 ========================
@@ -134,6 +236,9 @@ def main():
     ap.add_argument("--max-range", type=float, default=5.0, help="라이다 최대 거리 m")
     ap.add_argument("--yaw-deg", type=float, default=0.0,
                     help="스캔 회전 보정 테스트용 (라이다 장착 방향 의심 시 180 등)")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="plumb_bob undistort 의 getOptimalNewCameraMatrix alpha. "
+                         "생략 시 lib/bev.py 기본값 — H 캘리브 때와 같아야 한다")
     ap.add_argument("--no-grid", action="store_true", help="바닥 격자 생략")
     ap.add_argument("--no-show", action="store_true", help="창 표시 생략 (저장만)")
     args = ap.parse_args()
@@ -160,8 +265,8 @@ def main():
     img = cv2.imread(args.image)
     if img is None:
         sys.exit("이미지 읽기 실패: %s" % args.image)
-    K, D, H = _load_camera(args.camera)
-    disp = _undistort(img, K, D).copy()
+    H, undistort = _load_camera(args.camera, args.alpha)
+    disp = undistort(img).copy()
     Hinv = np.linalg.inv(H)
     sgn = _ref_sign(Hinv)
 

@@ -12,7 +12,9 @@
   - 3노드 → 1노드: 이미지 1회 수신으로 3모델 순차 추론 (콜백 1회 안에서).
   - encoding 하드코딩(rgb8 아니면 무음 드랍) → lib/preprocess.image_msg_to_bgr
     (실패 사유 5초 스로틀 경고 — 재도입 금지 버그 8 대응).
-  - config/camera.yaml 캘리브 로드 + 170도 어안 Undistorter (차선 처리 전 적용).
+  - config/camera.yaml 캘리브 로드 + Undistorter (차선 처리 전 적용).
+    렌즈는 실측 HFOV≈87.2°/VFOV≈64.1° 의 일반 광각(plumb_bob) — 어안 아님.
+    왜곡모델/new_K/alpha 는 전부 yaml 을 따른다 (bev.Undistorter.from_config).
   - /detect/road_pixels + /detect/events_raw → /detect/objects 통합.
     road_pixels 의 (u중심, v하단) 인코딩 계승, events_raw 의 x,y=0 방식 폐기
     (신호/표지 클래스도 u,v 를 채워 발행 — 거리 판단은 planner 몫).
@@ -48,6 +50,9 @@ DEFAULT_CAMERA_YAML = os.path.join(_PKG_ROOT, "config", "camera.yaml")
 
 LIDAR_FRAME = "lidar_frame"        # 예선 common.LIDAR_FRAME 과 동일
 CAM_FRONT_FRAME = "usb_cam_front"  # 예선 yolo_detect_node 와 동일
+
+# camera.yaml 에 image_width/height 가 없을 때 쓰는 기본 해상도 (usb_cam 실측 640x480)
+DEFAULT_IMAGE_SIZE = (640, 480)
 
 # ── 모델별 입력 색순서 정책 (근거: 예선 yolo_light_node.py:64-68 주석) ──
 # ultralytics 는 numpy 입력을 BGR 로 가정한다.
@@ -99,6 +104,10 @@ class YoloNode(Node):
         self.declare_parameter("obj_model_path", DEFAULT_OBJ_MODEL)
         self.declare_parameter("light_model_path", DEFAULT_LIGHT_MODEL)
         self.declare_parameter("camera_yaml", DEFAULT_CAMERA_YAML)
+        # undistort 의 getOptimalNewCameraMatrix alpha (plumb_bob 전용, 0=크롭/1=화소보존).
+        # ★ H 캘리브(tools/calib_ground_h.py) 때 쓴 alpha 와 반드시 같아야 한다 —
+        #   alpha 가 다르면 new_K 가 달라져 H 가 통째로 무효다.
+        self.declare_parameter("undistort_alpha", bev.UNDISTORT_ALPHA_DEFAULT)
 
         self._imgsz = int(self.get_parameter("imgsz").value)
         self._conf_lane = float(self.get_parameter("conf_lane").value)
@@ -107,18 +116,21 @@ class YoloNode(Node):
         self._debounce_n = max(1, int(self.get_parameter("light_debounce_n").value))
         self._device = str(self.get_parameter("device").value)
 
-        # ── 카메라 캘리브 (H: 이미지픽셀→라이다미터, K/D: 어안) ──
+        # ── 카메라 캘리브 (K/D: 렌즈 내부·왜곡, H: 이미지픽셀→라이다미터) ──
+        # K/D 유효성(intrinsics_calibrated)과 H 유효성(h_calibrated)은 별개다.
+        # K/D 만 잡힌 중간 상태에서도 undistort 는 켜져야 한다.
         camera_yaml = str(self.get_parameter("camera_yaml").value)
         self._cam = bev.load_camera_config(camera_yaml)
-        if not self._cam["calibrated"]:
-            self.get_logger().warn(
-                "\n" + "=" * 62 + "\n"
-                "  !! camera.yaml 미캘리브 (calibrated=false 또는 로드 실패) !!\n"
-                f"  path={camera_yaml}\n"
-                "  예선 시뮬 H 폴백으로 동작 — 실차 차선 좌표 부정확할 수 있음.\n"
-                "  어안 undistort 는 비활성(패스스루)됨.\n"
-                + "=" * 62)
-        self._undist = None  # 첫 프레임에서 실제 (w,h)로 생성
+        self._undist_alpha = float(self.get_parameter("undistort_alpha").value)
+        # 캘리브 기준 해상도로 미리 리맵 테이블 생성 → 기동 로그에서 상태 확정 가능.
+        # 실제 프레임 크기가 다르면 첫 프레임에서 그 크기로 다시 만든다.
+        self._undist_size = tuple(self._cam["image_size"] or DEFAULT_IMAGE_SIZE)
+        self._undist = bev.Undistorter.from_config(
+            self._cam, self._undist_size, alpha=self._undist_alpha)
+        # 차체 가림선 — 이 v 아래는 라이다 원통/범퍼라 지면이 아니다. 안 자르면
+        # 차체 화소가 BEV 에서 x≈0.1~0.2m 의 가짜 차선점으로 들어온다.
+        self._car_mask_v = self._cam["car_mask_v"]
+        self._log_camera_summary(camera_yaml)
 
         # ── 모델 로드 (스위치 꺼진 모델은 로드 자체를 생략 — CPU/메모리 절약) ──
         self._model_lane = (self._load_model("lane", str(self.get_parameter("lane_model_path").value))
@@ -159,6 +171,56 @@ class YoloNode(Node):
 
     # ---------------- 초기화 보조 ----------------
 
+    def _log_camera_summary(self, camera_yaml):
+        """카메라 캘리브 상태를 한 줄로 남긴다 — 현장에서 로그만 보고 판별 가능하게.
+
+        찍는 것: 왜곡모델 / 두 캘리브 플래그 / undistort 실제 활성 여부 / H 출처 /
+                 해상도 / note(폴백 사유). 이어서 문제가 있을 때만 경고를 덧붙인다.
+        """
+        cam = self._cam
+        intr = bool(cam["intrinsics_calibrated"])
+        h_ok = bool(cam["h_calibrated"])
+        w, h = self._undist_size
+        if self._undist.enabled:
+            nk = self._undist.new_K
+            undist = (f"enabled(alpha={self._undist_alpha:.2f}, "
+                      f"new_K fx={nk[0, 0]:.2f} fy={nk[1, 1]:.2f} "
+                      f"cx={nk[0, 2]:.2f} cy={nk[1, 2]:.2f})")
+        else:
+            undist = "disabled(passthrough)"
+        self.get_logger().info(
+            f"[camera] model={cam['model']} "
+            f"intrinsics_calibrated={str(intr).lower()} "
+            f"h_calibrated={str(h_ok).lower()} "
+            f"undistort={undist} "
+            f"H={'yaml' if h_ok else 'sim-fallback'} size={w}x{h} "
+            f"car_mask_v={'-' if self._car_mask_v is None else f'{self._car_mask_v:.0f}'} "
+            f"yaml={camera_yaml} note={cam['note'] or '-'}")
+
+        # 차체를 안 자르면 가짜 근거리 차선점이 계속 들어온다 — 조용히 넘기지 않는다.
+        if self._car_mask_v is None:
+            self.get_logger().warn(
+                "camera.yaml 에 car_mask_v 없음 — 차체(라이다/범퍼) 화소가 "
+                "BEV 근거리 가짜 차선점으로 들어올 수 있다. "
+                "tools/bev_view.py 에서 m 키로 가림선을 정하고 s 로 저장할 것.")
+
+        # K/D 는 유효한데 리맵 생성이 실패 → 조용히 패스스루로 도는 것을 막는다.
+        if intr and not self._undist.enabled:
+            self.get_logger().error(
+                "Undistorter 초기화 실패 (camera.yaml K/D 확인) — 패스스루로 동작")
+        # new_K 대조: H 는 캘리브 당시 new_K 기준이라 지금 값과 다르면 H 가 무효다.
+        if cam["new_K"] is not None:
+            msg = bev.check_new_K_match(cam["new_K"], self._undist.new_K)
+            if msg:
+                self.get_logger().warn(f"[camera] {msg}")
+            else:
+                self.get_logger().info(
+                    "[camera] new_K 일치 — H 좌표계가 런타임 undistort 와 같다")
+        if not h_ok:
+            self.get_logger().warn(
+                "[camera] H 미보정(h_calibrated=false) — 예선 시뮬 폴백 H 로 동작. "
+                "/detect/lane 좌표는 참고용이다. tools/calib_ground_h.py 로 잡을 것.")
+
     def _load_model(self, name, path):
         if not os.path.exists(path):
             self.get_logger().error(f"NO MODEL ({name}): {path}")
@@ -196,17 +258,22 @@ class YoloNode(Node):
                                    throttle_duration_sec=5.0)
             return
 
-        # 어안 undistort — 첫 프레임에서 실제 크기로 리맵 테이블 생성.
-        # 3모델 모두 undistort 된 프레임을 본다 (미캘리브 시 no-op 패스스루).
+        # 렌즈 왜곡 보정(undistort) — 리맵 테이블은 기동 때 캘리브 해상도로 이미 만들었다.
+        # 실제 프레임 크기가 캘리브 기준과 다르면 그 크기로 다시 만들고 경고한다
+        # (해상도가 바뀌면 new_K 가 달라져 H 가 무효 — 조용히 넘어가면 안 된다).
+        # 3모델 모두 undistort 된 프레임을 본다 (K/D 미보정 시 no-op 패스스루).
         # → /detect/objects 의 u,v 임계값(planner)은 undistort 프레임 기준으로 튜닝.
-        if self._undist is None:
-            h, w = bgr.shape[:2]
-            self._undist = bev.Undistorter(
-                self._cam["K"], self._cam["D"], (w, h),
-                calibrated=self._cam["calibrated"])
-            if self._cam["calibrated"] and not self._undist.enabled:
-                self.get_logger().error(
-                    "Undistorter 초기화 실패 (camera.yaml K/D 확인) — 패스스루로 동작")
+        h, w = bgr.shape[:2]
+        if (w, h) != self._undist_size:
+            self.get_logger().warn(
+                f"[camera] 프레임 크기 {w}x{h} 가 캘리브 기준 "
+                f"{self._undist_size[0]}x{self._undist_size[1]} 와 다르다 — "
+                "리맵 재생성. new_K 가 달라져 H 는 무효일 수 있다.")
+            self._undist_size = (w, h)
+            self._undist = bev.Undistorter.from_config(
+                self._cam, self._undist_size, alpha=self._undist_alpha)
+            self._log_camera_summary(
+                str(self.get_parameter("camera_yaml").value))
         frame = self._undist.apply(bgr)
 
         t_lane = t_obj = t_light = 0.0
@@ -283,6 +350,10 @@ class YoloNode(Node):
                         m = cv2.resize(m, (W_img, H_img),
                                        interpolation=cv2.INTER_NEAREST)
                     binmask[m > 0.5] = 255
+                # 차체(라이다 원통/범퍼) 영역 제거 — BEV 워프 전에 잘라야 한다.
+                # 캘리브 기준 높이를 넘겨 프레임 크기가 달라도 비율 환산되게 한다.
+                bev.apply_car_mask(binmask, self._car_mask_v,
+                                   calib_h=self._undist_size[1])
                 # 이미지픽셀 마스크 → BEV 워프 → 라이다 좌표 중심점 (검증된 lib 경로)
                 xs, ys = bev.mask_to_bev_points(binmask, self._cam["H"])
                 for x, y in zip(xs, ys):
@@ -315,11 +386,21 @@ class YoloNode(Node):
         if r is not None and r.boxes is not None and len(r.boxes) > 0:
             boxes = r.boxes.xyxy.cpu().numpy()  # (N,4): x1,y1,x2,y2
             classes = r.boxes.cls.cpu().numpy().astype(int)
+            # 차체 가림선 (없으면 None → 아래 판정 전부 통과)
+            mask_row = bev.car_mask_row(self._car_mask_v, frame.shape[0],
+                                        calib_h=self._undist_size[1])
             for bbox, cls_id in zip(boxes, classes):
                 cls_id = int(cls_id)
                 if cls_id in OBJ_IGNORE_CLASS_IDS:
                     continue
-                x1, _y1, x2, y2 = bbox
+                x1, y1, x2, y2 = bbox
+                if mask_row is not None:
+                    if y1 >= mask_row:
+                        continue          # 박스 전체가 차체 위 → 오검출, 버린다
+                    # 접지점만 차체에 걸친 경우는 버리지 않고 가림선까지 당긴다.
+                    # (범퍼 코앞의 진짜 장애물을 버리면 안 된다 — 가장 가까운
+                    #  거리로 읽히게 보수적으로 클램프)
+                    y2 = min(float(y2), float(mask_row))
                 p = Pose()
                 p.position.x = float((x1 + x2) * 0.5)  # u 중심
                 p.position.y = float(y2)               # v 하단 (클수록 가까움)

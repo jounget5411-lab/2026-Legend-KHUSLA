@@ -76,6 +76,10 @@ path_planner_node:
     cone_sample_x_end: 6.0         # [SIM]
     cone_sample_n: 25              # [SIM]
     # ---- 정지선(STOP) / SHORTCUT — heading은 전부 yaw_rel 기준 ----
+    # ★ 아래 *_v_thr* 는 전부 obj_v_ref_height(480p) 기준 픽셀값이다.
+    #   실차 카메라가 1080p 여도 planner 가 480p 로 환산해서 비교하므로
+    #   해상도를 바꿔도 이 값들은 그대로 두면 된다 (path_planner_node._resolve_obj_v_scale).
+    obj_v_ref_height: 480.0        # v 임계값들이 튜닝된 기준 높이 — 바꾸지 말 것
     stop_v_threshold: 312.0        # [SIM] 480p 기준 STOP bbox 하단 v
     cross_v_threshold: 278.0       # [SIM] CROSSROAD_OUT bbox 하단 v
     stop_heading_rel: 0.0          # 정지선 직선 구간 yaw_rel (deg) — 코스 실측 예정

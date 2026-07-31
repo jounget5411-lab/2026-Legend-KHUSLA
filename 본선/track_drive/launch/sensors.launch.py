@@ -2,7 +2,7 @@
 """센서 브링업 — usb_cam(respawn) + 차에만 있는 xycar 라이다/IMU launch include.
 
 역할: 카메라/라이다/IMU 를 한 번에 기동. 실행: ros2 launch track_drive sensors.launch.py
-입력: 없음. 출력: /image_raw(rgb8 640x480 ~30fps), /scan(BEST_EFFORT), /imu.
+입력: 없음. 출력: /image_raw(rgb8 1920x1080 30fps), /scan(BEST_EFFORT), /imu.
 예선 대비 변경점: 신규 파일 (예선은 시뮬이라 센서 브링업 없음).
   - usb_cam 은 첫 실행이 flaky(실측) → respawn=True 로 죽으면 자동 재기동.
   - xycar_lidar / xycar_imu 패키지는 실차에만 설치돼 있음 → 개발 PC 에서도
@@ -42,10 +42,15 @@ def generate_launch_description():
         respawn_delay=2.0,
         parameters=[{
             "video_device": "/dev/video0",   # 실차에서 다르면 여기만 수정 (예: /dev/videoCAM)
-            "pixel_format": "yuyv2rgb",      # → /image_raw 인코딩 rgb8 (실측)
-            "image_width": 640,
-            "image_height": 480,
-            "framerate": 30.0,               # 실측 ~29.8Hz
+            # ★ 해상도는 config/camera.yaml 의 image_width/height 와 반드시 일치해야 한다.
+            #   다르면 new_K 가 달라져 H(지면 좌표)가 통째로 무효다.
+            #   현재 캘리브 기준 = 1920x1080 (tools/ground_fit.py, tools/bev_view.py).
+            # MJPG 를 쓰는 이유: 이 카메라는 YUYV 1920x1080 이 6fps 밖에 안 나온다
+            #   (v4l2-ctl --list-formats-ext 실측). MJPG 여야 30fps.
+            "pixel_format": "mjpeg2rgb",     # → /image_raw 인코딩 rgb8
+            "image_width": 1920,
+            "image_height": 1080,
+            "framerate": 30.0,               # MJPG 1920x1080 이 지원하는 유일한 값
         }],
     )
 

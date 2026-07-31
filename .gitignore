@@ -14,3 +14,8 @@ Thumbs.db
 *.swp
 *.log
 /scripts/
+
+# 캘리브 작업 중 자동 생성되는 타임스탬프 백업 (원본은 dev/calib/ 에 보존)
+*.yaml.bak
+*.yaml.bak.*
+*.yaml.orig
