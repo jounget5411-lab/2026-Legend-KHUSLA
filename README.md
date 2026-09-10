@@ -1,23 +1,28 @@
 # 2026 국민대 자율주행 경진대회 — Legend KHUSLA
 
-## 구조
-- **`예선/`** — 예선(시뮬레이터) 최종 제출본. ROS2 Humble, track_drive 패키지 + 기록/스크립트.
-  (빌드 제외용 COLCON_IGNORE 포함 — 참고/보존용)
-- **`본선/track_drive/`** — 본선 실차(Xycar Y) 코드. 예선 코어(Pure Pursuit·polyfit·phase 머신)를 보존하고
-  실차 인터페이스(Float32MultiArray 모터, 어안 카메라, 500빔 라이다, VESC 텔레메트리)로 수술한 v3.1.
+## 코드 위치
 
-## 본선 실행
-```bash
-# 워크스페이스 루트에서 (예선/은 COLCON_IGNORE로 빌드 제외됨)
-colcon build --symlink-install --packages-select track_drive
-source install/setup.bash
-ros2 launch track_drive sensors.launch.py   # 센서 (차에서)
-ros2 launch track_drive drive.launch.py     # 자율주행 (규정 형식)
-ros2 launch track_drive viewer.launch.py    # 디버그 뷰어 (선택)
-ros2 run track_drive teleop                 # 수동 조종 (자율 중 개입 가능)
-```
+| 경로 | 내용 |
+|---|---|
+| [예선/](예선/) | 예선 시뮬레이터 최종 제출 코드. 기존 내용을 그대로 보존했다. |
+| [본선/](본선/) | 대회 최종 **V7** 코드. 팀 저장소의 고정 커밋을 파일 변경 없이 보관했다. |
+| [본선_배포모델/](본선_배포모델/) | 최종 설정과 대조한 배포 모델 및 체크섬. |
+| [보관/본선_v3.1/](보관/본선_v3.1/) | 기존 개인 저장소에 있던 CNN 도입 전 본선 실차 코드. |
 
-## 브랜치/태그
-- `main` — 이 구조 (예선/ + 본선/)
-- `feature/docs` — 예선 원본 레이아웃 보존, 태그: submit-final, submit-safe, jeongtaek-*, gosumin-*
-- `feature/realcar` — 본선 개발 히스토리 (예선 대비 diff 추적용)
+## 본선 최종본 기준
+
+- 원본: [KHUSLA-SANDI/KOOKMIN](https://github.com/KHUSLA-SANDI/KOOKMIN)
+- 원본 브랜치: `final/v7-current`
+- 원본 태그: `final-v7-20260824`
+- 고정 커밋: [`467f6dda6b71c48567225d3260d925d72818e3c1`](https://github.com/KHUSLA-SANDI/KOOKMIN/tree/467f6dda6b71c48567225d3260d925d72818e3c1)
+
+본선은 YOLO·BEV·LiDAR와 상황별 CNN으로 경로를 만들고, `simple_motion`으로 추종하는 버전이다.
+최종 V7에서는 장애물 추월에 하드코딩 조향 전략이 우선 적용된다.
+
+상세한 구조, 모델 배치, 실행 전제는 [본선 최종 V7 안내](본선_최종_V7_안내.md)를 참고한다.
+원본 V7 코드의 `본선/` 하위 파일 내용과 파일 모드는 그대로 보존했다. 기존 예선과 초기 본선도 보관되어 있다.
+
+## 예선 이력
+
+`feature/docs`와 `submit-final`, `submit-safe` 등의 기존 브랜치·태그는 예선 개발 및 제출 이력으로 유지한다.
+보관 코드의 중복 패키지가 빌드에 포함되지 않도록 `예선/`의 기존 `COLCON_IGNORE`와 `보관/COLCON_IGNORE`를 유지한다.

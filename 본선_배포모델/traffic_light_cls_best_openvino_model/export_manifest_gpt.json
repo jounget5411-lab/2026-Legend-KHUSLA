@@ -1,0 +1,27 @@
+{
+  "schema_version": "yolo_openvino_export_v2_gpt",
+  "source": "traffic_light_cls_best.pt",
+  "source_sha256": "5bb0e96f38977a98d7a7d336a8d4a0b40cb91f3a0c58b03ce947c84b163b1287",
+  "imgsz": [
+    224,
+    224
+  ],
+  "input_shape": [
+    1,
+    3,
+    224,
+    224
+  ],
+  "dynamic": false,
+  "batch": 1,
+  "precision": "FP32",
+  "task": "classify",
+  "classes": {
+    "0": "GREEN",
+    "1": "LEFT",
+    "2": "RED",
+    "3": "YELLOW"
+  },
+  "exported": "traffic_light_cls_best_openvino_model",
+  "created_utc": "2026-08-23T02:19:56.2637773Z"
+}

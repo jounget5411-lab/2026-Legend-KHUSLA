@@ -1,0 +1,93 @@
+{
+  "source_commit": "467f6dda6b71c48567225d3260d925d72818e3c1",
+  "files": [
+    {
+      "path": "cone_single_all967_final_gpt.pt",
+      "size_bytes": 2145617,
+      "sha256": "4844b66bb4440580b2cf39cc6ac7e5e8cc9538d3c1a13579f5267094abb18d13",
+      "verification": "SHA-256 matches the expected value in V7 perception_cnn.yaml."
+    },
+    {
+      "path": "general_single_best_gpt.pt",
+      "size_bytes": 6405302,
+      "sha256": "e90b0de551fdcdde5a5de96d754365380f49db412242535313c396a77201c1b1",
+      "verification": "SHA-256 matches the expected value in V7 perception_cnn.yaml."
+    },
+    {
+      "path": "left_shortcut_single_best_gpt.pt",
+      "size_bytes": 6406275,
+      "sha256": "88dc9a1da262c2622e2b618f1fb6789aa5027f3fc3f9bc03c04dcdbef648ae1a",
+      "verification": "SHA-256 matches the expected value in V7 perception_cnn.yaml."
+    },
+    {
+      "path": "obstacle_single_main508_best_gpt.pt",
+      "size_bytes": 6405955,
+      "sha256": "87fd7a0363d8544a1801b446a5ca16bcfcfd483ea52a8921255eb98562751003",
+      "verification": "SHA-256 matches the expected value in V7 perception_cnn.yaml."
+    },
+    {
+      "path": "traffic_detector_seg_best.pt",
+      "size_bytes": 6006756,
+      "sha256": "6ead43178acb34a1006c2c9d5b21a73f9d2500a9dcfc8f8ee8229c0c4e7acc59",
+      "verification": "SHA-256 matches the expected value in V7 perception_cnn.yaml."
+    },
+    {
+      "path": "traffic_detector_seg_best_openvino_model/export_manifest_gpt.json",
+      "size_bytes": 558,
+      "sha256": "ad636e61a114b07d06d827370784441647c55874e06c07332790104e12c7017f",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_detector_seg_best_openvino_model/metadata.yaml",
+      "size_bytes": 552,
+      "sha256": "a96130e5edbf243cb563effffc0dccf28df007e4882f51827a07f63e4363b9d1",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_detector_seg_best_openvino_model/traffic_detector_seg_best.bin",
+      "size_bytes": 11402180,
+      "sha256": "4acb2d64465cbd3da2d45f64696708727f7876a0e680e3893baa355c6d7e910f",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_detector_seg_best_openvino_model/traffic_detector_seg_best.xml",
+      "size_bytes": 356611,
+      "sha256": "bca961e206b5047c1234622d5f8404d39c62291fa9f883d8ca6ee19b3d377d69",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_light_cls_best.pt",
+      "size_bytes": 3192898,
+      "sha256": "5bb0e96f38977a98d7a7d336a8d4a0b40cb91f3a0c58b03ce947c84b163b1287",
+      "verification": "SHA-256 matches the expected value in V7 perception_cnn.yaml."
+    },
+    {
+      "path": "traffic_light_cls_best_openvino_model/export_manifest_gpt.json",
+      "size_bytes": 544,
+      "sha256": "2fcef15a995c8f7a94cb4f21f63e0ab60a1c782e1bc12299df870476428c5706",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_light_cls_best_openvino_model/metadata.yaml",
+      "size_bytes": 522,
+      "sha256": "b4553933bacbc073e189c390d7c5df89f71c9fd253c0ac34cf319eb45109e3f4",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_light_cls_best_openvino_model/traffic_light_cls_best.bin",
+      "size_bytes": 6124764,
+      "sha256": "156546a6bd940ad6e1991f84cdd37764c7afb2ee69e121b12f473e9b5cb5534e",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    },
+    {
+      "path": "traffic_light_cls_best_openvino_model/traffic_light_cls_best.xml",
+      "size_bytes": 138989,
+      "sha256": "9f25bf08cc867f0ead4361a9a66c60663d3d3df675c4c4ef3626859bd0e04519",
+      "verification": "Deployment export manifest source PT hash matches V7; per-file archive checksum recorded. No inference rerun."
+    }
+  ],
+  "notes": [
+    "All six PT artifacts match the expected SHA-256 values in the V7 runtime config.",
+    "OpenVINO export manifest source PT hashes match V7; export inference was not rerun during archival."
+  ]
+}

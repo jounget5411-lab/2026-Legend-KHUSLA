@@ -1,0 +1,27 @@
+description: Ultralytics YOLO11n-cls model trained on /content/trafficlight-class.-1
+author: Ultralytics
+date: '2026-08-23T11:10:47.329656+09:00'
+version: 8.4.124
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 1
+task: classify
+head: Classify
+batch: 1
+imgsz:
+- 224
+- 224
+names:
+  0: GREEN
+  1: LEFT
+  2: RED
+  3: YELLOW
+args:
+  data: null
+  batch: 1
+  fraction: 1.0
+  quantize: null
+  dynamic: false
+  nms: false
+channels: 3
+end2end: false

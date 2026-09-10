@@ -1,0 +1,27 @@
+description: Ultralytics YOLO11n-seg model trained on /content/trial1_yolo11n_seg_v1_gpt_dataset/data.yaml
+author: Ultralytics
+date: '2026-08-23T11:10:45.300120+09:00'
+version: 8.4.124
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: segment
+head: Segment
+batch: 1
+imgsz:
+- 384
+- 640
+names:
+  0: START_R
+  1: lane
+  2: mid
+  3: traffic_light
+args:
+  data: null
+  batch: 1
+  fraction: 1.0
+  quantize: null
+  dynamic: false
+  nms: false
+channels: 3
+end2end: false
